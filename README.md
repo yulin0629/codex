@@ -1,4 +1,4 @@
-<h1 align="center">OpenAI Codex CLI</h1>
+<h1 align="center">OpenAI Codex CLI</h1><a href="https://deepwiki.com/yulin0629/codex"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 <p align="center">Lightweight coding agent that runs in your terminal</p>
 
 <p align="center"><code>npm i -g @openai/codex</code></p>
