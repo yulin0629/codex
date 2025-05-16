@@ -173,6 +173,11 @@ function TerminalChatResponseToolCall({
     <Box flexDirection="column" gap={1}>
       <Text color="magentaBright" bold>
         command
+        {details?.workdir ? (
+          <Text dimColor>{` (${details?.workdir})`}</Text>
+        ) : (
+          ""
+        )}
       </Text>
       <Text>
         <Text dimColor>$</Text> {details?.cmdReadableText}
@@ -325,14 +330,12 @@ function rewriteFileCitations(
   fileOpener: FileOpenerScheme | undefined,
   cwd: string = process.cwd(),
 ): string {
-  if (!fileOpener) {
-    // Should we reformat the citations even if we cannot linkify them?
-    return markdown;
-  }
-
   citationRegex.lastIndex = 0;
   return markdown.replace(citationRegex, (_match, file, start, _end) => {
     const absPath = path.resolve(cwd, file);
+    if (!fileOpener) {
+      return `[${file}](${absPath})`;
+    }
     const uri = `${fileOpener}://file${absPath}:${start}`;
     const label = `${file}:${start}`;
     // In practice, sometimes multiple citations for the same file, but with a

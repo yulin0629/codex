@@ -16,6 +16,7 @@ use tracing_subscriber::prelude::*;
 
 mod app;
 mod app_event;
+mod app_event_sender;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
@@ -26,6 +27,7 @@ mod history_cell;
 mod log_layer;
 mod markdown;
 mod scroll_event_helper;
+mod slash_command;
 mod status_indicator_widget;
 mod tui;
 mod user_approval_widget;
@@ -68,7 +70,7 @@ pub fn run_main(cli: Cli) -> std::io::Result<()> {
         }
     };
 
-    let log_dir = codex_core::config::log_dir()?;
+    let log_dir = codex_core::config::log_dir(&config)?;
     std::fs::create_dir_all(&log_dir)?;
     // Open (or create) your log file, appending to it.
     let mut log_file_opts = OpenOptions::new();
@@ -160,7 +162,7 @@ fn run_ratatui_app(
         let app_event_tx = app.event_sender();
         tokio::spawn(async move {
             while let Some(line) = log_rx.recv().await {
-                let _ = app_event_tx.send(crate::app_event::AppEvent::LatestLog(line));
+                app_event_tx.send(crate::app_event::AppEvent::LatestLog(line));
             }
         });
     }
