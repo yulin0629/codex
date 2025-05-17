@@ -19,6 +19,7 @@ mod app_event;
 mod app_event_sender;
 mod bottom_pane;
 mod chatwidget;
+mod citation_regex;
 mod cli;
 mod conversation_history_widget;
 mod exec_command;
@@ -26,6 +27,7 @@ mod git_warning_screen;
 mod history_cell;
 mod log_layer;
 mod markdown;
+mod mouse_capture;
 mod scroll_event_helper;
 mod slash_command;
 mod status_indicator_widget;
@@ -151,7 +153,7 @@ fn run_ratatui_app(
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("panic: {info}");
     }));
-    let mut terminal = tui::init()?;
+    let (mut terminal, mut mouse_capture) = tui::init(&config)?;
     terminal.clear()?;
 
     let Cli { prompt, images, .. } = cli;
@@ -167,7 +169,7 @@ fn run_ratatui_app(
         });
     }
 
-    let app_result = app.run(&mut terminal);
+    let app_result = app.run(&mut terminal, &mut mouse_capture);
 
     restore();
     app_result
