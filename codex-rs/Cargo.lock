@@ -491,6 +491,7 @@ dependencies = [
  "codex-common",
  "codex-core",
  "codex-exec",
+ "codex-linux-sandbox",
  "codex-mcp-server",
  "codex-tui",
  "serde_json",
@@ -503,7 +504,6 @@ dependencies = [
 name = "codex-common"
 version = "0.0.0"
 dependencies = [
- "chrono",
  "clap",
  "codex-core",
 ]
@@ -526,7 +526,7 @@ dependencies = [
  "fs2",
  "futures",
  "landlock",
- "libc",
+ "maplit",
  "mcp-types",
  "mime_guess",
  "openssl-sys",
@@ -549,6 +549,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",
+ "wildmatch",
  "wiremock",
 ]
 
@@ -561,6 +562,7 @@ dependencies = [
  "clap",
  "codex-common",
  "codex-core",
+ "codex-linux-sandbox",
  "mcp-types",
  "owo-colors 4.2.0",
  "serde_json",
@@ -591,6 +593,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-linux-sandbox"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codex-common",
+ "codex-core",
+ "landlock",
+ "libc",
+ "seccompiler",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "codex-mcp-client"
 version = "0.0.0"
 dependencies = [
@@ -608,7 +625,9 @@ dependencies = [
 name = "codex-mcp-server"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "codex-core",
+ "codex-linux-sandbox",
  "mcp-types",
  "pretty_assertions",
  "schemars",
@@ -628,10 +647,15 @@ dependencies = [
  "codex-ansi-escape",
  "codex-common",
  "codex-core",
+ "codex-linux-sandbox",
  "color-eyre",
  "crossterm",
+ "lazy_static",
  "mcp-types",
+ "path-clean",
+ "pretty_assertions",
  "ratatui",
+ "regex",
  "serde_json",
  "shlex",
  "strum 0.27.1",
@@ -2470,6 +2494,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "path-clean"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
+
+[[package]]
 name = "path-dedot"
 version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4299,6 +4329,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ce1ab1f8c62655ebe1350f589c61e505cf94d385bc6a12899442d9081e71fd"
 
 [[package]]
 name = "winapi"

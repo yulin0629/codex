@@ -1,5 +1,6 @@
 use chrono::Utc;
 use codex_common::elapsed::format_elapsed;
+use codex_core::config::Config;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::BackgroundEventEvent;
 use codex_core::protocol::ErrorEvent;
@@ -17,6 +18,7 @@ use owo_colors::OwoColorize;
 use owo_colors::Style;
 use shlex::try_join;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
@@ -76,7 +78,7 @@ impl EventProcessor {
 
 struct ExecCommandBegin {
     command: Vec<String>,
-    start_time: chrono::DateTime<Utc>,
+    start_time: Instant,
 }
 
 /// Metadata captured when an `McpToolCallBegin` event is received.
@@ -84,11 +86,11 @@ struct McpToolCallBegin {
     /// Formatted invocation string, e.g. `server.tool({"city":"sf"})`.
     invocation: String,
     /// Timestamp when the call started so we can compute duration later.
-    start_time: chrono::DateTime<Utc>,
+    start_time: Instant,
 }
 
 struct PatchApplyBegin {
-    start_time: chrono::DateTime<Utc>,
+    start_time: Instant,
     auto_approved: bool,
 }
 
@@ -101,9 +103,36 @@ macro_rules! ts_println {
     }};
 }
 
+/// Print a concise summary of the effective configuration that will be used
+/// for the session. This mirrors the information shown in the TUI welcome
+/// screen.
+pub(crate) fn print_config_summary(config: &Config, with_ansi: bool) {
+    let bold = if with_ansi {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
+
+    ts_println!("OpenAI Codex (research preview)\n--------");
+
+    let entries = vec![
+        ("workdir", config.cwd.display().to_string()),
+        ("model", config.model.clone()),
+        ("provider", config.model_provider_id.clone()),
+        ("approval", format!("{:?}", config.approval_policy)),
+        ("sandbox", format!("{:?}", config.sandbox_policy)),
+    ];
+
+    for (key, value) in entries {
+        println!("{} {}", format!("{key}: ").style(bold), value);
+    }
+
+    println!("--------\n");
+}
+
 impl EventProcessor {
     pub(crate) fn process_event(&mut self, event: Event) {
-        let Event { id, msg } = event;
+        let Event { id: _, msg } = event;
         match msg {
             EventMsg::Error(ErrorEvent { message }) => {
                 let prefix = "ERROR:".style(self.red);
@@ -112,13 +141,8 @@ impl EventProcessor {
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 ts_println!("{}", message.style(self.dimmed));
             }
-            EventMsg::TaskStarted => {
-                let msg = format!("Task started: {id}");
-                ts_println!("{}", msg.style(self.dimmed));
-            }
-            EventMsg::TaskComplete => {
-                let msg = format!("Task complete: {id}");
-                ts_println!("{}", msg.style(self.bold));
+            EventMsg::TaskStarted | EventMsg::TaskComplete(_) => {
+                // Ignore.
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                 let prefix = "Agent message:".style(self.bold);
@@ -133,7 +157,7 @@ impl EventProcessor {
                     call_id.clone(),
                     ExecCommandBegin {
                         command: command.clone(),
-                        start_time: Utc::now(),
+                        start_time: Instant::now(),
                     },
                 );
                 ts_println!(
@@ -208,7 +232,7 @@ impl EventProcessor {
                     call_id.clone(),
                     McpToolCallBegin {
                         invocation: invocation.clone(),
-                        start_time: Utc::now(),
+                        start_time: Instant::now(),
                     },
                 );
 
@@ -263,7 +287,7 @@ impl EventProcessor {
                 self.call_id_to_patch.insert(
                     call_id.clone(),
                     PatchApplyBegin {
-                        start_time: Utc::now(),
+                        start_time: Instant::now(),
                         auto_approved,
                     },
                 );
@@ -381,7 +405,15 @@ impl EventProcessor {
                     history_log_id: _,
                     history_entry_count: _,
                 } = session_configured_event;
-                println!("session {session_id} with model {model}");
+
+                ts_println!(
+                    "{} {}",
+                    "codex session".style(self.magenta).style(self.bold),
+                    session_id.to_string().style(self.dimmed)
+                );
+
+                ts_println!("model: {}", model);
+                println!();
             }
             EventMsg::GetHistoryEntryResponse(_) => {
                 // Currently ignored in exec output.
