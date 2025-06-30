@@ -2,14 +2,27 @@ name: 自動同步 Fork
 on:
   schedule:
     - cron: '0 0 * * *'  # 每天午夜執行一次
-  workflow_dispatch:  # 允許手動觸發
+  workflow_dispatch:      # 允許手動觸發
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: tgymnich/fork-sync@v1.8
+      - name: 取得自己 repo 的 main
+        uses: actions/checkout@v4
         with:
-          owner: openai
-          base: main     # 您的分支名稱，根據需要修改
-          head: main     # 上游分支名稱，根據需要修改
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 設定上游（openai/codex）
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/openai/codex.git
+          git fetch upstream
+
+      - name: 合併上游 main 並 push
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
