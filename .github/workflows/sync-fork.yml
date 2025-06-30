@@ -1,4 +1,4 @@
-name: 自動同步 Fork (使用專用 Action)
+name: 自動同步 Fork
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -7,12 +7,69 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: 同步上游
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+      - name: 檢出倉庫
+        uses: actions/checkout@v4
         with:
-          upstream_sync_repo: openai/codex
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 設定 Git 配置
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 同步上游更新
+        run: |
+          # 添加上游遠端（如果不存在）
+          if ! git remote | grep -q upstream; then
+            git remote add upstream https://github.com/openai/codex.git
+          fi
+          
+          # 獲取上游更新
+          git fetch upstream
+          
+          # 檢查本地分支是否存在
+          if ! git show-ref --verify --quiet refs/heads/main; then
+            git checkout -b main origin/main
+          else
+            git checkout main
+          fi
+          
+          # 獲取目前的 commit hash
+          BEFORE_SYNC=$(git rev-parse HEAD)
+          
+          # 嘗試快進合併
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            echo "執行快進合併..."
+            git merge --ff-only upstream/main
+          elif git merge-base --is-ancestor upstream/main HEAD; then
+            echo "本地分支已經是最新的"
+            exit 0
+          else
+            echo "需要執行合併..."
+            # 嘗試自動合併，優先採用上游的變更
+            if ! git merge upstream/main -X theirs --no-edit; then
+              echo "自動合併失敗，嘗試重置為上游版本..."
+              git reset --hard upstream/main
+            fi
+          fi
+          
+          # 檢查是否有變更
+          AFTER_SYNC=$(git rev-parse HEAD)
+          if [ "$BEFORE_SYNC" != "$AFTER_SYNC" ]; then
+            echo "檢測到變更，推送到 origin..."
+            git push origin main
+            echo "同步完成！"
+          else
+            echo "沒有新的變更需要同步"
+          fi
+
+      - name: 輸出同步結果
+        run: |
+          echo "同步狀態："
+          git log --oneline -5
+          echo "遠端狀態："
+          git remote -v
