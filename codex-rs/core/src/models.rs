@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use base64::Engine;
+use mcp_types::CallToolResult;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::ser::Serializer;
@@ -15,6 +18,10 @@ pub enum ResponseInputItem {
     FunctionCallOutput {
         call_id: String,
         output: FunctionCallOutputPayload,
+    },
+    McpToolCallOutput {
+        call_id: String,
+        result: Result<CallToolResult, String>,
     },
 }
 
@@ -36,6 +43,14 @@ pub enum ResponseItem {
     Reasoning {
         id: String,
         summary: Vec<ReasoningItemReasoningSummary>,
+    },
+    LocalShellCall {
+        /// Set when using the chat completions API.
+        id: Option<String>,
+        /// Set when using the Responses API.
+        call_id: Option<String>,
+        status: LocalShellStatus,
+        action: LocalShellAction,
     },
     FunctionCall {
         name: String,
@@ -67,8 +82,44 @@ impl From<ResponseInputItem> for ResponseItem {
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }
             }
+            ResponseInputItem::McpToolCallOutput { call_id, result } => Self::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    success: Some(result.is_ok()),
+                    content: result.map_or_else(
+                        |tool_call_err| format!("err: {tool_call_err:?}"),
+                        |result| {
+                            serde_json::to_string(&result)
+                                .unwrap_or_else(|e| format!("JSON serialization error: {e}"))
+                        },
+                    ),
+                },
+            },
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalShellStatus {
+    Completed,
+    InProgress,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LocalShellAction {
+    Exec(LocalShellExecAction),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalShellExecAction {
+    pub command: Vec<String>,
+    pub timeout_ms: Option<u64>,
+    pub working_directory: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

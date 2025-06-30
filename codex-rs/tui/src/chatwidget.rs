@@ -17,6 +17,8 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::TaskCompleteEvent;
+use codex_core::protocol::TokenUsage;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -36,6 +38,7 @@ use crate::bottom_pane::InputResult;
 use crate::conversation_history_widget::ConversationHistoryWidget;
 use crate::history_cell::PatchEventType;
 use crate::user_approval_widget::ApprovalRequest;
+use codex_file_search::FileMatch;
 
 pub(crate) struct ChatWidget<'a> {
     app_event_tx: AppEventSender,
@@ -44,12 +47,36 @@ pub(crate) struct ChatWidget<'a> {
     bottom_pane: BottomPane<'a>,
     input_focus: InputFocus,
     config: Config,
+    initial_user_message: Option<UserMessage>,
+    token_usage: TokenUsage,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum InputFocus {
     HistoryPane,
     BottomPane,
+}
+
+struct UserMessage {
+    text: String,
+    image_paths: Vec<PathBuf>,
+}
+
+impl From<String> for UserMessage {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            image_paths: Vec::new(),
+        }
+    }
+}
+
+fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Option<UserMessage> {
+    if text.is_empty() && image_paths.is_empty() {
+        None
+    } else {
+        Some(UserMessage { text, image_paths })
+    }
 }
 
 impl ChatWidget<'_> {
@@ -93,7 +120,7 @@ impl ChatWidget<'_> {
             }
         });
 
-        let mut chat_widget = Self {
+        Self {
             app_event_tx: app_event_tx.clone(),
             codex_op_tx,
             conversation_history: ConversationHistoryWidget::new(),
@@ -103,22 +130,21 @@ impl ChatWidget<'_> {
             }),
             input_focus: InputFocus::BottomPane,
             config,
-        };
-
-        if initial_prompt.is_some() || !initial_images.is_empty() {
-            let text = initial_prompt.unwrap_or_default();
-            chat_widget.submit_user_message_with_images(text, initial_images);
+            initial_user_message: create_initial_user_message(
+                initial_prompt.unwrap_or_default(),
+                initial_images,
+            ),
+            token_usage: TokenUsage::default(),
         }
-
-        chat_widget
     }
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        self.bottom_pane.clear_ctrl_c_quit_hint();
         // Special-case <Tab>: normally toggles focus between history and bottom panes.
         // However, when the slash-command popup is visible we forward the key
         // to the bottom pane so it can handle auto-completion.
         if matches!(key_event.code, crossterm::event::KeyCode::Tab)
-            && !self.bottom_pane.is_command_popup_visible()
+            && !self.bottom_pane.is_popup_visible()
         {
             self.input_focus = match self.input_focus {
                 InputFocus::HistoryPane => InputFocus::BottomPane,
@@ -129,6 +155,7 @@ impl ChatWidget<'_> {
             self.bottom_pane
                 .set_input_focus(self.input_focus == InputFocus::BottomPane);
             self.request_redraw();
+            return;
         }
 
         match self.input_focus {
@@ -140,19 +167,15 @@ impl ChatWidget<'_> {
             }
             InputFocus::BottomPane => match self.bottom_pane.handle_key_event(key_event) {
                 InputResult::Submitted(text) => {
-                    self.submit_user_message(text);
+                    self.submit_user_message(text.into());
                 }
                 InputResult::None => {}
             },
         }
     }
 
-    fn submit_user_message(&mut self, text: String) {
-        // Forward to codex and update conversation history.
-        self.submit_user_message_with_images(text, vec![]);
-    }
-
-    fn submit_user_message_with_images(&mut self, text: String, image_paths: Vec<PathBuf>) {
+    fn submit_user_message(&mut self, user_message: UserMessage) {
+        let UserMessage { text, image_paths } = user_message;
         let mut items: Vec<InputItem> = Vec::new();
 
         if !text.is_empty() {
@@ -189,11 +212,6 @@ impl ChatWidget<'_> {
         self.conversation_history.scroll_to_bottom();
     }
 
-    pub(crate) fn clear_conversation_history(&mut self) {
-        self.conversation_history.clear();
-        self.request_redraw();
-    }
-
     pub(crate) fn handle_codex_event(&mut self, event: Event) {
         let Event { id, msg } = event;
         match msg {
@@ -206,23 +224,42 @@ impl ChatWidget<'_> {
                 // composer can navigate through past messages.
                 self.bottom_pane
                     .set_history_metadata(event.history_log_id, event.history_entry_count);
+
+                if let Some(user_message) = self.initial_user_message.take() {
+                    // If the user provided an initial message, add it to the
+                    // conversation history.
+                    self.submit_user_message(user_message);
+                }
+
                 self.request_redraw();
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
-                self.conversation_history.add_agent_message(message);
+                self.conversation_history
+                    .add_agent_message(&self.config, message);
                 self.request_redraw();
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                self.conversation_history.add_agent_reasoning(text);
-                self.request_redraw();
+                if !self.config.hide_agent_reasoning {
+                    self.conversation_history
+                        .add_agent_reasoning(&self.config, text);
+                    self.request_redraw();
+                }
             }
             EventMsg::TaskStarted => {
+                self.bottom_pane.clear_ctrl_c_quit_hint();
                 self.bottom_pane.set_task_running(true);
                 self.request_redraw();
             }
-            EventMsg::TaskComplete => {
+            EventMsg::TaskComplete(TaskCompleteEvent {
+                last_agent_message: _,
+            }) => {
                 self.bottom_pane.set_task_running(false);
                 self.request_redraw();
+            }
+            EventMsg::TokenCount(token_usage) => {
+                self.token_usage = add_token_usage(&self.token_usage, &token_usage);
+                self.bottom_pane
+                    .set_token_usage(self.token_usage.clone(), self.config.model_context_window);
             }
             EventMsg::Error(ErrorEvent { message }) => {
                 self.conversation_history.add_error(message);
@@ -314,11 +351,9 @@ impl ChatWidget<'_> {
                     .add_active_mcp_tool_call(call_id, server, tool, arguments);
                 self.request_redraw();
             }
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-                call_id,
-                success,
-                result,
-            }) => {
+            EventMsg::McpToolCallEnd(mcp_tool_call_end_event) => {
+                let success = mcp_tool_call_end_event.is_success();
+                let McpToolCallEndEvent { call_id, result } = mcp_tool_call_end_event;
                 self.conversation_history
                     .record_completed_mcp_tool_call(call_id, success, result);
                 self.request_redraw();
@@ -352,6 +387,11 @@ impl ChatWidget<'_> {
         self.app_event_tx.send(AppEvent::Redraw);
     }
 
+    pub(crate) fn add_diff_output(&mut self, diff_output: String) {
+        self.conversation_history.add_diff_output(diff_output);
+        self.request_redraw();
+    }
+
     pub(crate) fn handle_scroll_delta(&mut self, scroll_delta: i32) {
         // If the user is trying to scroll exactly one line, we let them, but
         // otherwise we assume they are trying to scroll in larger increments.
@@ -363,6 +403,27 @@ impl ChatWidget<'_> {
         };
         self.conversation_history.scroll(magnified_scroll_delta);
         self.request_redraw();
+    }
+
+    /// Forward file-search results to the bottom pane.
+    pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
+        self.bottom_pane.on_file_search_result(query, matches);
+    }
+
+    /// Handle Ctrl-C key press.
+    /// Returns true if the key press was handled, false if it was not.
+    /// If the key press was not handled, the caller should handle it (likely by exiting the process).
+    pub(crate) fn on_ctrl_c(&mut self) -> bool {
+        if self.bottom_pane.is_task_running() {
+            self.bottom_pane.clear_ctrl_c_quit_hint();
+            self.submit_op(Op::Interrupt);
+            false
+        } else if self.bottom_pane.ctrl_c_quit_hint_visible() {
+            true
+        } else {
+            self.bottom_pane.show_ctrl_c_quit_hint();
+            false
+        }
     }
 
     /// Forward an `Op` directly to codex.
@@ -384,5 +445,33 @@ impl WidgetRef for &ChatWidget<'_> {
 
         self.conversation_history.render(chunks[0], buf);
         (&self.bottom_pane).render(chunks[1], buf);
+    }
+}
+
+fn add_token_usage(current_usage: &TokenUsage, new_usage: &TokenUsage) -> TokenUsage {
+    let cached_input_tokens = match (
+        current_usage.cached_input_tokens,
+        new_usage.cached_input_tokens,
+    ) {
+        (Some(current), Some(new)) => Some(current + new),
+        (Some(current), None) => Some(current),
+        (None, Some(new)) => Some(new),
+        (None, None) => None,
+    };
+    let reasoning_output_tokens = match (
+        current_usage.reasoning_output_tokens,
+        new_usage.reasoning_output_tokens,
+    ) {
+        (Some(current), Some(new)) => Some(current + new),
+        (Some(current), None) => Some(current),
+        (None, Some(new)) => Some(new),
+        (None, None) => None,
+    };
+    TokenUsage {
+        input_tokens: current_usage.input_tokens + new_usage.input_tokens,
+        cached_input_tokens,
+        output_tokens: current_usage.output_tokens + new_usage.output_tokens,
+        reasoning_output_tokens,
+        total_tokens: current_usage.total_tokens + new_usage.total_tokens,
     }
 }

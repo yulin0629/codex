@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::env::VarError;
 
 use crate::error::EnvVarError;
+use crate::openai_api_key::get_openai_api_key;
 
 /// Wire protocol that the provider speaks. Most third-party services only
 /// implement the classic OpenAI Chat Completions JSON schema, whereas OpenAI
@@ -52,20 +53,27 @@ impl ModelProviderInfo {
     /// cannot be found, returns an error.
     pub fn api_key(&self) -> crate::error::Result<Option<String>> {
         match &self.env_key {
-            Some(env_key) => std::env::var(env_key)
-                .and_then(|v| {
-                    if v.trim().is_empty() {
-                        Err(VarError::NotPresent)
-                    } else {
-                        Ok(Some(v))
-                    }
-                })
-                .map_err(|_| {
-                    crate::error::CodexErr::EnvVar(EnvVarError {
-                        var: env_key.clone(),
-                        instructions: self.env_key_instructions.clone(),
+            Some(env_key) => {
+                let env_value = if env_key == crate::openai_api_key::OPENAI_API_KEY_ENV_VAR {
+                    get_openai_api_key().map_or_else(|| Err(VarError::NotPresent), Ok)
+                } else {
+                    std::env::var(env_key)
+                };
+                env_value
+                    .and_then(|v| {
+                        if v.trim().is_empty() {
+                            Err(VarError::NotPresent)
+                        } else {
+                            Ok(Some(v))
+                        }
                     })
-                }),
+                    .map_err(|_| {
+                        crate::error::CodexErr::EnvVar(EnvVarError {
+                            var: env_key.clone(),
+                            instructions: self.env_key_instructions.clone(),
+                        })
+                    })
+            }
             None => Ok(None),
         }
     }
@@ -75,6 +83,10 @@ impl ModelProviderInfo {
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     use ModelProviderInfo as P;
 
+    // We do not want to be in the business of adjucating which third-party
+    // providers are bundled with Codex CLI, so we only include the OpenAI
+    // provider by default. Users are encouraged to add to `model_providers`
+    // in config.toml to add their own providers.
     [
         (
             "openai",
@@ -84,76 +96,6 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key: Some("OPENAI_API_KEY".into()),
                 env_key_instructions: Some("Create an API key (https://platform.openai.com) and export it as an environment variable.".into()),
                 wire_api: WireApi::Responses,
-            },
-        ),
-        (
-            "openrouter",
-            P {
-                name: "OpenRouter".into(),
-                base_url: "https://openrouter.ai/api/v1".into(),
-                env_key: Some("OPENROUTER_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "gemini",
-            P {
-                name: "Gemini".into(),
-                base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
-                env_key: Some("GEMINI_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "ollama",
-            P {
-                name: "Ollama".into(),
-                base_url: "http://localhost:11434/v1".into(),
-                env_key: None,
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "mistral",
-            P {
-                name: "Mistral".into(),
-                base_url: "https://api.mistral.ai/v1".into(),
-                env_key: Some("MISTRAL_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "deepseek",
-            P {
-                name: "DeepSeek".into(),
-                base_url: "https://api.deepseek.com".into(),
-                env_key: Some("DEEPSEEK_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "xai",
-            P {
-                name: "xAI".into(),
-                base_url: "https://api.x.ai/v1".into(),
-                env_key: Some("XAI_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
-            },
-        ),
-        (
-            "groq",
-            P {
-                name: "Groq".into(),
-                base_url: "https://api.groq.com/openai/v1".into(),
-                env_key: Some("GROQ_API_KEY".into()),
-                env_key_instructions: None,
-                wire_api: WireApi::Chat,
             },
         ),
     ]

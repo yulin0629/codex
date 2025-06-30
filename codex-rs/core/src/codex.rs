@@ -1,6 +1,7 @@
 // Poisoned mutex should fail the program
 #![allow(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,6 +21,7 @@ use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_apply_patch::print_summary;
 use futures::prelude::*;
+use mcp_types::CallToolResult;
 use serde::Serialize;
 use serde_json;
 use tokio::sync::Notify;
@@ -37,24 +39,28 @@ use crate::client::ModelClient;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::config::Config;
+use crate::config_types::ShellEnvironmentPolicy;
 use crate::conversation_history::ConversationHistory;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
+use crate::error::SandboxErr;
 use crate::exec::ExecParams;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::process_exec_tool_call;
+use crate::exec_env::create_env;
 use crate::flags::OPENAI_STREAM_MAX_RETRIES;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_connection_manager::try_parse_fully_qualified_tool_name;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::models::ContentItem;
 use crate::models::FunctionCallOutputPayload;
+use crate::models::LocalShellAction;
 use crate::models::ReasoningItemReasoningSummary;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::ShellToolCallParams;
-use crate::project_doc::create_full_instructions;
+use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
@@ -75,6 +81,7 @@ use crate::protocol::ReviewDecision;
 use crate::protocol::SandboxPolicy;
 use crate::protocol::SessionConfiguredEvent;
 use crate::protocol::Submission;
+use crate::protocol::TaskCompleteEvent;
 use crate::rollout::RolloutRecorder;
 use crate::safety::SafetyCheck;
 use crate::safety::assess_command_safety;
@@ -98,10 +105,12 @@ impl Codex {
         let (tx_sub, rx_sub) = async_channel::bounded(64);
         let (tx_event, rx_event) = async_channel::bounded(64);
 
-        let instructions = create_full_instructions(&config).await;
+        let instructions = get_user_instructions(&config).await;
         let configure_session = Op::ConfigureSession {
             provider: config.model_provider.clone(),
             model: config.model.clone(),
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
             instructions,
             approval_policy: config.approval_policy,
             sandbox_policy: config.sandbox_policy.clone(),
@@ -168,6 +177,7 @@ pub(crate) struct Session {
     instructions: Option<String>,
     approval_policy: AskForApproval,
     sandbox_policy: SandboxPolicy,
+    shell_environment_policy: ShellEnvironmentPolicy,
     writable_roots: Mutex<Vec<PathBuf>>,
 
     /// Manager for external MCP servers/tools.
@@ -179,8 +189,9 @@ pub(crate) struct Session {
 
     /// Optional rollout recorder for persisting the conversation transcript so
     /// sessions can be replayed or inspected later.
-    rollout: Mutex<Option<crate::rollout::RolloutRecorder>>,
+    rollout: Mutex<Option<RolloutRecorder>>,
     state: Mutex<State>,
+    codex_linux_sandbox_exe: Option<PathBuf>,
 }
 
 impl Session {
@@ -196,6 +207,9 @@ impl Session {
 struct State {
     approved_commands: HashSet<Vec<String>>,
     current_task: Option<AgentTask>,
+    /// Call IDs that have been sent from the Responses API but have not been sent back yet.
+    /// You CANNOT send a Responses API follow-up message unless you have sent back the output for all pending calls or else it will 400.
+    pending_call_ids: HashSet<String>,
     previous_response_id: Option<String>,
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_input: Vec<ResponseInputItem>,
@@ -288,10 +302,21 @@ impl Session {
         state.approved_commands.insert(cmd);
     }
 
+    /// Records items to both the rollout and the chat completions/ZDR
+    /// transcript, if enabled.
+    async fn record_conversation_items(&self, items: &[ResponseItem]) {
+        debug!("Recording items for conversation: {items:?}");
+        self.record_rollout_items(items).await;
+
+        if let Some(transcript) = self.state.lock().unwrap().zdr_transcript.as_mut() {
+            transcript.record_items(items);
+        }
+    }
+
     /// Append the given items to the session's rollout transcript (if enabled)
     /// and persist them to disk.
     async fn record_rollout_items(&self, items: &[ResponseItem]) {
-        // Clone the recorder outside of the mutex so we don’t hold the lock
+        // Clone the recorder outside of the mutex so we don't hold the lock
         // across an await point (MutexGuard is not Send).
         let recorder = {
             let guard = self.rollout.lock().unwrap();
@@ -381,7 +406,7 @@ impl Session {
         tool: &str,
         arguments: Option<serde_json::Value>,
         timeout: Option<Duration>,
-    ) -> anyhow::Result<mcp_types::CallToolResult> {
+    ) -> anyhow::Result<CallToolResult> {
         self.mcp_connection_manager
             .call_tool(server, tool, arguments, timeout)
             .await
@@ -390,6 +415,8 @@ impl Session {
     pub fn abort(&self) {
         info!("Aborting existing session");
         let mut state = self.state.lock().unwrap();
+        // Don't clear pending_call_ids because we need to keep track of them to ensure we don't 400 on the next turn.
+        // We will generate a synthetic aborted response for each pending call id.
         state.pending_approvals.clear();
         state.pending_input.clear();
         if let Some(task) = state.current_task.take() {
@@ -410,7 +437,7 @@ impl Session {
         }
 
         let Ok(json) = serde_json::to_string(&notification) else {
-            tracing::error!("failed to serialise notification payload");
+            error!("failed to serialise notification payload");
             return;
         };
 
@@ -422,7 +449,7 @@ impl Session {
 
         // Fire-and-forget – we do not wait for completion.
         if let Err(e) = command.spawn() {
-            tracing::warn!("failed to spawn notifier '{}': {e}", notify_command[0]);
+            warn!("failed to spawn notifier '{}': {e}", notify_command[0]);
         }
     }
 }
@@ -535,6 +562,8 @@ async fn submission_loop(
             Op::ConfigureSession {
                 provider,
                 model,
+                model_reasoning_effort,
+                model_reasoning_summary,
                 instructions,
                 approval_policy,
                 sandbox_policy,
@@ -556,7 +585,12 @@ async fn submission_loop(
                     return;
                 }
 
-                let client = ModelClient::new(model.clone(), provider.clone());
+                let client = ModelClient::new(
+                    model.clone(),
+                    provider.clone(),
+                    model_reasoning_effort,
+                    model_reasoning_summary,
+                );
 
                 // abort any current running session and clone its state
                 let retain_zdr_transcript =
@@ -619,7 +653,7 @@ async fn submission_loop(
                     match RolloutRecorder::new(&config, session_id, instructions.clone()).await {
                         Ok(r) => Some(r),
                         Err(e) => {
-                            tracing::warn!("failed to initialise rollout recorder: {e}");
+                            warn!("failed to initialise rollout recorder: {e}");
                             None
                         }
                     };
@@ -631,12 +665,14 @@ async fn submission_loop(
                     instructions,
                     approval_policy,
                     sandbox_policy,
+                    shell_environment_policy: config.shell_environment_policy.clone(),
                     cwd,
                     writable_roots,
                     mcp_connection_manager,
                     notify,
                     state: Mutex::new(state),
                     rollout: Mutex::new(rollout_recorder),
+                    codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
                 }));
 
                 // Gather history metadata for SessionConfiguredEvent.
@@ -712,7 +748,7 @@ async fn submission_loop(
                 tokio::spawn(async move {
                     if let Err(e) = crate::message_history::append_entry(&text, &id, &config).await
                     {
-                        tracing::warn!("failed to append to message history: {e}");
+                        warn!("failed to append to message history: {e}");
                     }
                 });
             }
@@ -742,7 +778,7 @@ async fn submission_loop(
                     };
 
                     if let Err(e) = tx_event.send(event).await {
-                        tracing::warn!("failed to send GetHistoryEntryResponse event: {e}");
+                        warn!("failed to send GetHistoryEntryResponse event: {e}");
                     }
                 });
             }
@@ -751,6 +787,19 @@ async fn submission_loop(
     debug!("Agent loop exited");
 }
 
+/// Takes a user message as input and runs a loop where, at each turn, the model
+/// replies with either:
+///
+/// - requested function calls
+/// - an assistant message
+///
+/// While it is possible for the model to return multiple of these items in a
+/// single turn, in practice, we generally one item per turn:
+///
+/// - If the model requests a function call, we execute it and send the output
+///   back to the model in the next turn.
+/// - If the model sends only an assistant message, we record it in the
+///   conversation history and consider the task complete.
 async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
     if input.is_empty() {
         return;
@@ -763,9 +812,14 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         return;
     }
 
-    let mut pending_response_input: Vec<ResponseInputItem> = vec![ResponseInputItem::from(input)];
+    let initial_input_for_turn = ResponseInputItem::from(input);
+    sess.record_conversation_items(&[initial_input_for_turn.clone().into()])
+        .await;
+
+    let mut input_for_next_turn: Vec<ResponseInputItem> = vec![initial_input_for_turn];
+    let last_agent_message: Option<String>;
     loop {
-        let mut net_new_turn_input = pending_response_input
+        let mut net_new_turn_input = input_for_next_turn
             .drain(..)
             .map(ResponseItem::from)
             .collect::<Vec<_>>();
@@ -773,11 +827,12 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = sess.get_pending_input().into_iter().map(ResponseItem::from);
-        net_new_turn_input.extend(pending_input);
-
-        // Persist only the net-new items of this turn to the rollout.
-        sess.record_rollout_items(&net_new_turn_input).await;
+        let pending_input = sess
+            .get_pending_input()
+            .into_iter()
+            .map(ResponseItem::from)
+            .collect::<Vec<ResponseItem>>();
+        sess.record_conversation_items(&pending_input).await;
 
         // Construct the input that we will send to the model. When using the
         // Chat completions API (or ZDR clients), the model needs the full
@@ -786,20 +841,24 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         // represents an append-only log without duplicates.
         let turn_input: Vec<ResponseItem> =
             if let Some(transcript) = sess.state.lock().unwrap().zdr_transcript.as_mut() {
-                // If we are using Chat/ZDR, we need to send the transcript with every turn.
-
-                // 1. Build up the conversation history for the next turn.
-                let full_transcript = [transcript.contents(), net_new_turn_input.clone()].concat();
-
-                // 2. Update the in-memory transcript so that future turns
-                // include these items as part of the history.
-                transcript.record_items(net_new_turn_input);
-
-                // Note that `transcript.record_items()` does some filtering
-                // such that `full_transcript` may include items that were
-                // excluded from `transcript`.
-                full_transcript
+                // If we are using Chat/ZDR, we need to send the transcript with
+                // every turn. By induction, `transcript` already contains:
+                // - The `input` that kicked off this task.
+                // - Each `ResponseItem` that was recorded in the previous turn.
+                // - Each response to a `ResponseItem` (in practice, the only
+                //   response type we seem to have is `FunctionCallOutput`).
+                //
+                // The only thing the `transcript` does not contain is the
+                // `pending_input` that was injected while the model was
+                // running. We need to add that to the conversation history
+                // so that the model can see it in the next turn.
+                [transcript.contents(), pending_input].concat()
             } else {
+                // In practice, net_new_turn_input should contain only:
+                // - User messages
+                // - Outputs for function calls requested by the model
+                net_new_turn_input.extend(pending_input);
+
                 // Responses API path – we can just send the new items and
                 // record the same.
                 net_new_turn_input
@@ -820,38 +879,95 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
             .collect();
         match run_turn(&sess, sub_id.clone(), turn_input).await {
             Ok(turn_output) => {
-                let (items, responses): (Vec<_>, Vec<_>) = turn_output
-                    .into_iter()
-                    .map(|p| (p.item, p.response))
-                    .unzip();
-                let responses = responses
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<ResponseInputItem>>();
-                let last_assistant_message = get_last_assistant_message_from_turn(&items);
+                let mut items_to_record_in_conversation_history = Vec::<ResponseItem>::new();
+                let mut responses = Vec::<ResponseInputItem>::new();
+                for processed_response_item in turn_output {
+                    let ProcessedResponseItem { item, response } = processed_response_item;
+                    match (&item, &response) {
+                        (ResponseItem::Message { role, .. }, None) if role == "assistant" => {
+                            // If the model returned a message, we need to record it.
+                            items_to_record_in_conversation_history.push(item);
+                        }
+                        (
+                            ResponseItem::LocalShellCall { .. },
+                            Some(ResponseInputItem::FunctionCallOutput { call_id, output }),
+                        ) => {
+                            items_to_record_in_conversation_history.push(item);
+                            items_to_record_in_conversation_history.push(
+                                ResponseItem::FunctionCallOutput {
+                                    call_id: call_id.clone(),
+                                    output: output.clone(),
+                                },
+                            );
+                        }
+                        (
+                            ResponseItem::FunctionCall { .. },
+                            Some(ResponseInputItem::FunctionCallOutput { call_id, output }),
+                        ) => {
+                            items_to_record_in_conversation_history.push(item);
+                            items_to_record_in_conversation_history.push(
+                                ResponseItem::FunctionCallOutput {
+                                    call_id: call_id.clone(),
+                                    output: output.clone(),
+                                },
+                            );
+                        }
+                        (
+                            ResponseItem::FunctionCall { .. },
+                            Some(ResponseInputItem::McpToolCallOutput { call_id, result }),
+                        ) => {
+                            items_to_record_in_conversation_history.push(item);
+                            let (content, success): (String, Option<bool>) = match result {
+                                Ok(CallToolResult { content, is_error }) => {
+                                    match serde_json::to_string(content) {
+                                        Ok(content) => (content, *is_error),
+                                        Err(e) => {
+                                            warn!("Failed to serialize MCP tool call output: {e}");
+                                            (e.to_string(), Some(true))
+                                        }
+                                    }
+                                }
+                                Err(e) => (e.clone(), Some(true)),
+                            };
+                            items_to_record_in_conversation_history.push(
+                                ResponseItem::FunctionCallOutput {
+                                    call_id: call_id.clone(),
+                                    output: FunctionCallOutputPayload { content, success },
+                                },
+                            );
+                        }
+                        (ResponseItem::Reasoning { .. }, None) => {
+                            // Omit from conversation history.
+                        }
+                        _ => {
+                            warn!("Unexpected response item: {item:?} with response: {response:?}");
+                        }
+                    };
+                    if let Some(response) = response {
+                        responses.push(response);
+                    }
+                }
 
                 // Only attempt to take the lock if there is something to record.
-                if !items.is_empty() {
-                    // First persist model-generated output to the rollout file – this only borrows.
-                    sess.record_rollout_items(&items).await;
-
-                    // For ZDR we also need to keep a transcript clone.
-                    if let Some(transcript) = sess.state.lock().unwrap().zdr_transcript.as_mut() {
-                        transcript.record_items(items);
-                    }
+                if !items_to_record_in_conversation_history.is_empty() {
+                    sess.record_conversation_items(&items_to_record_in_conversation_history)
+                        .await;
                 }
 
                 if responses.is_empty() {
                     debug!("Turn completed");
+                    last_agent_message = get_last_assistant_message_from_turn(
+                        &items_to_record_in_conversation_history,
+                    );
                     sess.maybe_notify(UserNotification::AgentTurnComplete {
                         turn_id: sub_id.clone(),
                         input_messages: turn_input_messages,
-                        last_assistant_message,
+                        last_assistant_message: last_agent_message.clone(),
                     });
                     break;
                 }
 
-                pending_response_input = responses;
+                input_for_next_turn = responses;
             }
             Err(e) => {
                 info!("Turn error: {e:#}");
@@ -869,7 +985,7 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
     sess.remove_task(&sub_id);
     let event = Event {
         id: sub_id,
-        msg: EventMsg::TaskComplete,
+        msg: EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }),
     };
     sess.tx_event.send(event).await.ok();
 }
@@ -880,9 +996,8 @@ async fn run_turn(
     input: Vec<ResponseItem>,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
     // Decide whether to use server-side storage (previous_response_id) or disable it
-    let (prev_id, store, is_first_turn) = {
+    let (prev_id, store) = {
         let state = sess.state.lock().unwrap();
-        let is_first_turn = state.previous_response_id.is_none();
         let store = state.zdr_transcript.is_none();
         let prev_id = if store {
             state.previous_response_id.clone()
@@ -891,20 +1006,14 @@ async fn run_turn(
             // back, but trying to use it results in a 400.
             None
         };
-        (prev_id, store, is_first_turn)
-    };
-
-    let instructions = if is_first_turn {
-        sess.instructions.clone()
-    } else {
-        None
+        (prev_id, store)
     };
 
     let extra_tools = sess.mcp_connection_manager.list_all_tools();
     let prompt = Prompt {
         input,
         prev_id,
-        instructions,
+        user_instructions: sess.instructions.clone(),
         store,
         extra_tools,
     };
@@ -949,6 +1058,7 @@ async fn run_turn(
 /// events map to a `ResponseItem`. A `ResponseItem` may need to be
 /// "handled" such that it produces a `ResponseInputItem` that needs to be
 /// sent back to the model on the next turn.
+#[derive(Debug)]
 struct ProcessedResponseItem {
     item: ResponseItem,
     response: Option<ResponseInputItem>,
@@ -959,7 +1069,57 @@ async fn try_run_turn(
     sub_id: &str,
     prompt: &Prompt,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
-    let mut stream = sess.client.clone().stream(prompt).await?;
+    // call_ids that are part of this response.
+    let completed_call_ids = prompt
+        .input
+        .iter()
+        .filter_map(|ri| match ri {
+            ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id),
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => Some(call_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    // call_ids that were pending but are not part of this response.
+    // This usually happens because the user interrupted the model before we responded to one of its tool calls
+    // and then the user sent a follow-up message.
+    let missing_calls = {
+        sess.state
+            .lock()
+            .unwrap()
+            .pending_call_ids
+            .iter()
+            .filter_map(|call_id| {
+                if completed_call_ids.contains(&call_id) {
+                    None
+                } else {
+                    Some(call_id.clone())
+                }
+            })
+            .map(|call_id| ResponseItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: FunctionCallOutputPayload {
+                    content: "aborted".to_string(),
+                    success: Some(false),
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+    let prompt: Cow<Prompt> = if missing_calls.is_empty() {
+        Cow::Borrowed(prompt)
+    } else {
+        // Add the synthetic aborted missing calls to the beginning of the input to ensure all call ids have responses.
+        let input = [missing_calls, prompt.input.clone()].concat();
+        Cow::Owned(Prompt {
+            input,
+            ..prompt.clone()
+        })
+    };
+
+    let mut stream = sess.client.clone().stream(&prompt).await?;
 
     // Buffer all the incoming messages from the stream first, then execute them.
     // If we execute a function call in the middle of handling the stream, it can time out.
@@ -971,11 +1131,43 @@ async fn try_run_turn(
     let mut output = Vec::new();
     for event in input {
         match event {
+            ResponseEvent::Created => {
+                let mut state = sess.state.lock().unwrap();
+                // We successfully created a new response and ensured that all pending calls were included so we can clear the pending call ids.
+                state.pending_call_ids.clear();
+            }
             ResponseEvent::OutputItemDone(item) => {
+                let call_id = match &item {
+                    ResponseItem::LocalShellCall {
+                        call_id: Some(call_id),
+                        ..
+                    } => Some(call_id),
+                    ResponseItem::FunctionCall { call_id, .. } => Some(call_id),
+                    _ => None,
+                };
+                if let Some(call_id) = call_id {
+                    // We just got a new call id so we need to make sure to respond to it in the next turn.
+                    let mut state = sess.state.lock().unwrap();
+                    state.pending_call_ids.insert(call_id.clone());
+                }
                 let response = handle_response_item(sess, sub_id, item.clone()).await?;
+
                 output.push(ProcessedResponseItem { item, response });
             }
-            ResponseEvent::Completed { response_id } => {
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+            } => {
+                if let Some(token_usage) = token_usage {
+                    sess.tx_event
+                        .send(Event {
+                            id: sub_id.to_string(),
+                            msg: EventMsg::TokenCount(token_usage),
+                        })
+                        .await
+                        .ok();
+                }
+
                 let mut state = sess.state.lock().unwrap();
                 state.previous_response_id = Some(response_id);
                 break;
@@ -991,8 +1183,7 @@ async fn handle_response_item(
     item: ResponseItem,
 ) -> CodexResult<Option<ResponseInputItem>> {
     debug!(?item, "Output item");
-    let mut output = None;
-    match item {
+    let output = match item {
         ResponseItem::Message { content, .. } => {
             for item in content {
                 if let ContentItem::OutputText { text } = item {
@@ -1003,6 +1194,7 @@ async fn handle_response_item(
                     sess.tx_event.send(event).await.ok();
                 }
             }
+            None
         }
         ResponseItem::Reasoning { id: _, summary } => {
             for item in summary {
@@ -1015,21 +1207,61 @@ async fn handle_response_item(
                 };
                 sess.tx_event.send(event).await.ok();
             }
+            None
         }
         ResponseItem::FunctionCall {
             name,
             arguments,
             call_id,
         } => {
-            output = Some(
-                handle_function_call(sess, sub_id.to_string(), name, arguments, call_id).await,
-            );
+            info!("FunctionCall: {arguments}");
+            Some(handle_function_call(sess, sub_id.to_string(), name, arguments, call_id).await)
+        }
+        ResponseItem::LocalShellCall {
+            id,
+            call_id,
+            status: _,
+            action,
+        } => {
+            let LocalShellAction::Exec(action) = action;
+            tracing::info!("LocalShellCall: {action:?}");
+            let params = ShellToolCallParams {
+                command: action.command,
+                workdir: action.working_directory,
+                timeout_ms: action.timeout_ms,
+            };
+            let effective_call_id = match (call_id, id) {
+                (Some(call_id), _) => call_id,
+                (None, Some(id)) => id,
+                (None, None) => {
+                    error!("LocalShellCall without call_id or id");
+                    return Ok(Some(ResponseInputItem::FunctionCallOutput {
+                        call_id: "".to_string(),
+                        output: FunctionCallOutputPayload {
+                            content: "LocalShellCall without call_id or id".to_string(),
+                            success: None,
+                        },
+                    }));
+                }
+            };
+
+            let exec_params = to_exec_params(params, sess);
+            Some(
+                handle_container_exec_with_params(
+                    exec_params,
+                    sess,
+                    sub_id.to_string(),
+                    effective_call_id,
+                )
+                .await,
+            )
         }
         ResponseItem::FunctionCallOutput { .. } => {
             debug!("unexpected FunctionCallOutput from stream");
+            None
         }
-        ResponseItem::Other => (),
-    }
+        ResponseItem::Other => None,
+    };
     Ok(output)
 }
 
@@ -1042,124 +1274,293 @@ async fn handle_function_call(
 ) -> ResponseInputItem {
     match name.as_str() {
         "container.exec" | "shell" => {
-            // parse command
-            let params: ExecParams = match serde_json::from_str::<ShellToolCallParams>(&arguments) {
-                Ok(shell_tool_call_params) => ExecParams {
-                    command: shell_tool_call_params.command,
-                    cwd: sess.resolve_path(shell_tool_call_params.workdir.clone()),
-                    timeout_ms: shell_tool_call_params.timeout_ms,
-                },
-                Err(e) => {
-                    // allow model to re-sample
-                    let output = ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: crate::models::FunctionCallOutputPayload {
-                            content: format!("failed to parse function arguments: {e}"),
-                            success: None,
-                        },
-                    };
+            let params = match parse_container_exec_arguments(arguments, sess, &call_id) {
+                Ok(params) => params,
+                Err(output) => {
                     return output;
                 }
             };
-
-            // check if this was a patch, and apply it if so
-            match maybe_parse_apply_patch_verified(&params.command, &params.cwd) {
-                MaybeApplyPatchVerified::Body(changes) => {
-                    return apply_patch(sess, sub_id, call_id, changes).await;
+            handle_container_exec_with_params(params, sess, sub_id, call_id).await
+        }
+        _ => {
+            match try_parse_fully_qualified_tool_name(&name) {
+                Some((server, tool_name)) => {
+                    // TODO(mbolin): Determine appropriate timeout for tool call.
+                    let timeout = None;
+                    handle_mcp_tool_call(
+                        sess, &sub_id, call_id, server, tool_name, arguments, timeout,
+                    )
+                    .await
                 }
-                MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-                    // It looks like an invocation of `apply_patch`, but we
-                    // could not resolve it into a patch that would apply
-                    // cleanly. Return to model for resample.
+                None => {
+                    // Unknown function: reply with structured failure so the model can adapt.
+                    ResponseInputItem::FunctionCallOutput {
+                        call_id,
+                        output: FunctionCallOutputPayload {
+                            content: format!("unsupported call: {}", name),
+                            success: None,
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
+    ExecParams {
+        command: params.command,
+        cwd: sess.resolve_path(params.workdir.clone()),
+        timeout_ms: params.timeout_ms,
+        env: create_env(&sess.shell_environment_policy),
+    }
+}
+
+fn parse_container_exec_arguments(
+    arguments: String,
+    sess: &Session,
+    call_id: &str,
+) -> Result<ExecParams, ResponseInputItem> {
+    // parse command
+    match serde_json::from_str::<ShellToolCallParams>(&arguments) {
+        Ok(shell_tool_call_params) => Ok(to_exec_params(shell_tool_call_params, sess)),
+        Err(e) => {
+            // allow model to re-sample
+            let output = ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload {
+                    content: format!("failed to parse function arguments: {e}"),
+                    success: None,
+                },
+            };
+            Err(output)
+        }
+    }
+}
+
+async fn handle_container_exec_with_params(
+    params: ExecParams,
+    sess: &Session,
+    sub_id: String,
+    call_id: String,
+) -> ResponseInputItem {
+    // check if this was a patch, and apply it if so
+    match maybe_parse_apply_patch_verified(&params.command, &params.cwd) {
+        MaybeApplyPatchVerified::Body(changes) => {
+            return apply_patch(sess, sub_id, call_id, changes).await;
+        }
+        MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+            // It looks like an invocation of `apply_patch`, but we
+            // could not resolve it into a patch that would apply
+            // cleanly. Return to model for resample.
+            return ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: format!("error: {parse_error:#}"),
+                    success: None,
+                },
+            };
+        }
+        MaybeApplyPatchVerified::ShellParseError(error) => {
+            trace!("Failed to parse shell command, {error:?}");
+        }
+        MaybeApplyPatchVerified::NotApplyPatch => (),
+    }
+
+    // safety checks
+    let safety = {
+        let state = sess.state.lock().unwrap();
+        assess_command_safety(
+            &params.command,
+            sess.approval_policy,
+            &sess.sandbox_policy,
+            &state.approved_commands,
+        )
+    };
+    let sandbox_type = match safety {
+        SafetyCheck::AutoApprove { sandbox_type } => sandbox_type,
+        SafetyCheck::AskUser => {
+            let rx_approve = sess
+                .request_command_approval(
+                    sub_id.clone(),
+                    params.command.clone(),
+                    params.cwd.clone(),
+                    None,
+                )
+                .await;
+            match rx_approve.await.unwrap_or_default() {
+                ReviewDecision::Approved => (),
+                ReviewDecision::ApprovedForSession => {
+                    sess.add_approved_command(params.command.clone());
+                }
+                ReviewDecision::Denied | ReviewDecision::Abort => {
                     return ResponseInputItem::FunctionCallOutput {
                         call_id,
                         output: FunctionCallOutputPayload {
-                            content: format!("error: {parse_error:#}"),
+                            content: "exec command rejected by user".to_string(),
                             success: None,
                         },
                     };
                 }
-                MaybeApplyPatchVerified::ShellParseError(error) => {
-                    trace!("Failed to parse shell command, {error}");
-                }
-                MaybeApplyPatchVerified::NotApplyPatch => (),
             }
-
-            // safety checks
-            let safety = {
-                let state = sess.state.lock().unwrap();
-                assess_command_safety(
-                    &params.command,
-                    sess.approval_policy,
-                    &sess.sandbox_policy,
-                    &state.approved_commands,
-                )
+            // No sandboxing is applied because the user has given
+            // explicit approval. Often, we end up in this case because
+            // the command cannot be run in a sandbox, such as
+            // installing a new dependency that requires network access.
+            SandboxType::None
+        }
+        SafetyCheck::Reject { reason } => {
+            return ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: format!("exec command rejected: {reason}"),
+                    success: None,
+                },
             };
-            let sandbox_type = match safety {
-                SafetyCheck::AutoApprove { sandbox_type } => sandbox_type,
-                SafetyCheck::AskUser => {
-                    let rx_approve = sess
-                        .request_command_approval(
-                            sub_id.clone(),
-                            params.command.clone(),
-                            params.cwd.clone(),
-                            None,
-                        )
-                        .await;
-                    match rx_approve.await.unwrap_or_default() {
-                        ReviewDecision::Approved => (),
-                        ReviewDecision::ApprovedForSession => {
-                            sess.add_approved_command(params.command.clone());
-                        }
-                        ReviewDecision::Denied | ReviewDecision::Abort => {
-                            return ResponseInputItem::FunctionCallOutput {
-                                call_id,
-                                output: crate::models::FunctionCallOutputPayload {
-                                    content: "exec command rejected by user".to_string(),
-                                    success: None,
-                                },
-                            };
-                        }
-                    }
-                    // No sandboxing is applied because the user has given
-                    // explicit approval. Often, we end up in this case because
-                    // the command cannot be run in a sandbox, such as
-                    // installing a new dependency that requires network access.
-                    SandboxType::None
-                }
-                SafetyCheck::Reject { reason } => {
-                    return ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: crate::models::FunctionCallOutputPayload {
-                            content: format!("exec command rejected: {reason}"),
-                            success: None,
-                        },
-                    };
-                }
-            };
+        }
+    };
 
-            sess.notify_exec_command_begin(&sub_id, &call_id, &params)
+    sess.notify_exec_command_begin(&sub_id, &call_id, &params)
+        .await;
+
+    let output_result = process_exec_tool_call(
+        params.clone(),
+        sandbox_type,
+        sess.ctrl_c.clone(),
+        &sess.sandbox_policy,
+        &sess.codex_linux_sandbox_exe,
+    )
+    .await;
+
+    match output_result {
+        Ok(output) => {
+            let ExecToolCallOutput {
+                exit_code,
+                stdout,
+                stderr,
+                duration,
+            } = output;
+
+            sess.notify_exec_command_end(&sub_id, &call_id, &stdout, &stderr, exit_code)
                 .await;
 
-            let output_result = process_exec_tool_call(
-                params.clone(),
-                sandbox_type,
+            let is_success = exit_code == 0;
+            let content = format_exec_output(
+                if is_success { &stdout } else { &stderr },
+                exit_code,
+                duration,
+            );
+
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content,
+                    success: Some(is_success),
+                },
+            }
+        }
+        Err(CodexErr::Sandbox(error)) => {
+            handle_sandbox_error(error, sandbox_type, params, sess, sub_id, call_id).await
+        }
+        Err(e) => {
+            // Handle non-sandbox errors
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: format!("execution error: {e}"),
+                    success: None,
+                },
+            }
+        }
+    }
+}
+
+async fn handle_sandbox_error(
+    error: SandboxErr,
+    sandbox_type: SandboxType,
+    params: ExecParams,
+    sess: &Session,
+    sub_id: String,
+    call_id: String,
+) -> ResponseInputItem {
+    // Early out if the user never wants to be asked for approval; just return to the model immediately
+    if sess.approval_policy == AskForApproval::Never {
+        return ResponseInputItem::FunctionCallOutput {
+            call_id,
+            output: FunctionCallOutputPayload {
+                content: format!(
+                    "failed in sandbox {:?} with execution error: {error}",
+                    sandbox_type
+                ),
+                success: Some(false),
+            },
+        };
+    }
+
+    // Note that when `error` is `SandboxErr::Denied`, it could be a false
+    // positive. That is, it may have exited with a non-zero exit code, not
+    // because the sandbox denied it, but because that is its expected behavior,
+    // i.e., a grep command that did not match anything. Ideally we would
+    // include additional metadata on the command to indicate whether non-zero
+    // exit codes merit a retry.
+
+    // For now, we categorically ask the user to retry without sandbox.
+    sess.notify_background_event(&sub_id, format!("Execution failed: {error}"))
+        .await;
+
+    let rx_approve = sess
+        .request_command_approval(
+            sub_id.clone(),
+            params.command.clone(),
+            params.cwd.clone(),
+            Some("command failed; retry without sandbox?".to_string()),
+        )
+        .await;
+
+    match rx_approve.await.unwrap_or_default() {
+        ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
+            // Persist this command as pre‑approved for the
+            // remainder of the session so future
+            // executions skip the sandbox directly.
+            // TODO(ragona): Isn't this a bug? It always saves the command in an | fork?
+            sess.add_approved_command(params.command.clone());
+            // Inform UI we are retrying without sandbox.
+            sess.notify_background_event(&sub_id, "retrying command without sandbox")
+                .await;
+
+            // Emit a fresh Begin event so progress bars reset.
+            let retry_call_id = format!("{call_id}-retry");
+            sess.notify_exec_command_begin(&sub_id, &retry_call_id, &params)
+                .await;
+
+            // This is an escalated retry; the policy will not be
+            // examined and the sandbox has been set to `None`.
+            let retry_output_result = process_exec_tool_call(
+                params,
+                SandboxType::None,
                 sess.ctrl_c.clone(),
                 &sess.sandbox_policy,
+                &sess.codex_linux_sandbox_exe,
             )
             .await;
 
-            match output_result {
-                Ok(output) => {
+            match retry_output_result {
+                Ok(retry_output) => {
                     let ExecToolCallOutput {
                         exit_code,
                         stdout,
                         stderr,
                         duration,
-                    } = output;
+                    } = retry_output;
 
-                    sess.notify_exec_command_end(&sub_id, &call_id, &stdout, &stderr, exit_code)
-                        .await;
+                    sess.notify_exec_command_end(
+                        &sub_id,
+                        &retry_call_id,
+                        &stdout,
+                        &stderr,
+                        exit_code,
+                    )
+                    .await;
 
                     let is_success = exit_code == 0;
                     let content = format_exec_output(
@@ -1176,152 +1577,26 @@ async fn handle_function_call(
                         },
                     }
                 }
-                Err(CodexErr::Sandbox(e)) => {
-                    // Early out if the user never wants to be asked for approval; just return to the model immediately
-                    if sess.approval_policy == AskForApproval::Never {
-                        return ResponseInputItem::FunctionCallOutput {
-                            call_id,
-                            output: FunctionCallOutputPayload {
-                                content: format!(
-                                    "failed in sandbox {:?} with execution error: {e}",
-                                    sandbox_type
-                                ),
-                                success: Some(false),
-                            },
-                        };
-                    }
-
-                    // Ask the user to retry without sandbox
-                    sess.notify_background_event(&sub_id, format!("Execution failed: {e}"))
-                        .await;
-
-                    let rx_approve = sess
-                        .request_command_approval(
-                            sub_id.clone(),
-                            params.command.clone(),
-                            params.cwd.clone(),
-                            Some("command failed; retry without sandbox?".to_string()),
-                        )
-                        .await;
-
-                    match rx_approve.await.unwrap_or_default() {
-                        ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
-                            // Persist this command as pre‑approved for the
-                            // remainder of the session so future
-                            // executions skip the sandbox directly.
-                            // TODO(ragona): Isn't this a bug? It always saves the command in an | fork?
-                            sess.add_approved_command(params.command.clone());
-                            // Inform UI we are retrying without sandbox.
-                            sess.notify_background_event(
-                                &sub_id,
-                                "retrying command without sandbox",
-                            )
-                            .await;
-
-                            // Emit a fresh Begin event so progress bars reset.
-                            let retry_call_id = format!("{call_id}-retry");
-                            sess.notify_exec_command_begin(&sub_id, &retry_call_id, &params)
-                                .await;
-
-                            // This is an escalated retry; the policy will not be
-                            // examined and the sandbox has been set to `None`.
-                            let retry_output_result = process_exec_tool_call(
-                                params,
-                                SandboxType::None,
-                                sess.ctrl_c.clone(),
-                                &sess.sandbox_policy,
-                            )
-                            .await;
-
-                            match retry_output_result {
-                                Ok(retry_output) => {
-                                    let ExecToolCallOutput {
-                                        exit_code,
-                                        stdout,
-                                        stderr,
-                                        duration,
-                                    } = retry_output;
-
-                                    sess.notify_exec_command_end(
-                                        &sub_id,
-                                        &retry_call_id,
-                                        &stdout,
-                                        &stderr,
-                                        exit_code,
-                                    )
-                                    .await;
-
-                                    let is_success = exit_code == 0;
-                                    let content = format_exec_output(
-                                        if is_success { &stdout } else { &stderr },
-                                        exit_code,
-                                        duration,
-                                    );
-
-                                    ResponseInputItem::FunctionCallOutput {
-                                        call_id,
-                                        output: FunctionCallOutputPayload {
-                                            content,
-                                            success: Some(is_success),
-                                        },
-                                    }
-                                }
-                                Err(e) => {
-                                    // Handle retry failure
-                                    ResponseInputItem::FunctionCallOutput {
-                                        call_id,
-                                        output: FunctionCallOutputPayload {
-                                            content: format!("retry failed: {e}"),
-                                            success: None,
-                                        },
-                                    }
-                                }
-                            }
-                        }
-                        ReviewDecision::Denied | ReviewDecision::Abort => {
-                            // Fall through to original failure handling.
-                            ResponseInputItem::FunctionCallOutput {
-                                call_id,
-                                output: FunctionCallOutputPayload {
-                                    content: "exec command rejected by user".to_string(),
-                                    success: None,
-                                },
-                            }
-                        }
-                    }
-                }
                 Err(e) => {
-                    // Handle non-sandbox errors
+                    // Handle retry failure
                     ResponseInputItem::FunctionCallOutput {
                         call_id,
                         output: FunctionCallOutputPayload {
-                            content: format!("execution error: {e}"),
+                            content: format!("retry failed: {e}"),
                             success: None,
                         },
                     }
                 }
             }
         }
-        _ => {
-            match try_parse_fully_qualified_tool_name(&name) {
-                Some((server, tool_name)) => {
-                    // TODO(mbolin): Determine appropriate timeout for tool call.
-                    let timeout = None;
-                    handle_mcp_tool_call(
-                        sess, &sub_id, call_id, server, tool_name, arguments, timeout,
-                    )
-                    .await
-                }
-                None => {
-                    // Unknown function: reply with structured failure so the model can adapt.
-                    ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: crate::models::FunctionCallOutputPayload {
-                            content: format!("unsupported call: {}", name),
-                            success: None,
-                        },
-                    }
-                }
+        ReviewDecision::Denied | ReviewDecision::Abort => {
+            // Fall through to original failure handling.
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: "exec command rejected by user".to_string(),
+                    success: None,
+                },
             }
         }
     }
@@ -1671,7 +1946,7 @@ fn apply_changes_from_apply_patch(action: &ApplyPatchAction) -> anyhow::Result<A
     })
 }
 
-fn get_writable_roots(cwd: &Path) -> Vec<std::path::PathBuf> {
+fn get_writable_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut writable_roots = Vec::new();
     if cfg!(target_os = "macos") {
         // On macOS, $TMPDIR is private to the user.
@@ -1699,7 +1974,7 @@ fn get_writable_roots(cwd: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Exec output is a pre-serialized JSON payload
-fn format_exec_output(output: &str, exit_code: i32, duration: std::time::Duration) -> String {
+fn format_exec_output(output: &str, exit_code: i32, duration: Duration) -> String {
     #[derive(Serialize)]
     struct ExecMetadata {
         exit_code: i32,
