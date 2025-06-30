@@ -9,11 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
+      workflows: write
     steps:
       - name: 檢出倉庫
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}  # 使用 PAT 而不是 GITHUB_TOKEN
           fetch-depth: 0
 
       - name: 設定 Git 配置
@@ -66,10 +68,3 @@ jobs:
           else
             echo "沒有新的變更需要同步"
           fi
-
-      - name: 輸出同步結果
-        run: |
-          echo "同步狀態："
-          git log --oneline -5
-          echo "遠端狀態："
-          git remote -v
