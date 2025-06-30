@@ -1,8 +1,8 @@
 name: 自動同步 Fork
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *'  # 每天午夜執行一次
+  workflow_dispatch:      # 允許手動觸發
 
 jobs:
   sync:
@@ -10,12 +10,11 @@ jobs:
     permissions:
       contents: write
       actions: write
-      workflows: write
     steps:
       - name: 檢出倉庫
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PAT_TOKEN }}  # 使用 PAT 而不是 GITHUB_TOKEN
+          token: ${{ secrets.PAT_TOKEN }}  # 需要先設定 PAT_TOKEN
           fetch-depth: 0
 
       - name: 設定 Git 配置
