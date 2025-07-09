@@ -94,15 +94,15 @@ env_http_headers = { "X-Example-Features": "EXAMPLE_FEATURES" }
 
 ## model_provider
 
-Identifies which provider to use from the `model_providers` map. Defaults to `"openai"`.
+Identifies which provider to use from the `model_providers` map. Defaults to `"openai"`. You can override the `base_url` for the built-in `openai` provider via the `OPENAI_BASE_URL` environment variable.
 
 Note that if you override `model_provider`, then you likely want to override
 `model`, as well. For example, if you are running ollama with Mistral locally,
 then you would need to add the following to your config in addition to the new entry in the `model_providers` map:
 
 ```toml
-model = "mistral"
 model_provider = "ollama"
+model = "mistral"
 ```
 
 ## approval_policy
@@ -157,6 +157,8 @@ wire_api = "chat"
 model = "o3"
 model_provider = "openai"
 approval_policy = "never"
+model_reasoning_effort = "high"
+model_reasoning_summary = "detailed"
 
 [profiles.gpt3]
 model = "gpt-3.5-turbo"
@@ -204,36 +206,41 @@ To disable reasoning summaries, set `model_reasoning_summary` to `"none"` in you
 model_reasoning_summary = "none"  # disable reasoning summaries
 ```
 
-## sandbox
+## sandbox_mode
 
-The `sandbox` configuration determines the _sandbox policy_ that Codex uses to execute untrusted commands. The `mode` determines the "base policy." Currently, only `workspace-write` supports additional configuration options, but this may change in the future.
+Codex executes model-generated shell commands inside an OS-level sandbox.
 
-The default policy is `read-only`, which means commands can read any file on disk, but attempts to write a file or access the network will be blocked.
+In most cases you can pick the desired behaviour with a single option:
 
 ```toml
-[sandbox]
-mode = "read-only"
+# same as `--sandbox read-only`
+sandbox_mode = "read-only"
 ```
 
-A more relaxed policy is `workspace-write`. When specified, the current working directory for the Codex task will be writable (as well as `$TMPDIR` on macOS). Note that the CLI defaults to using `cwd` where it was spawned, though this can be overridden using `--cwd/-C`.
+The default policy is `read-only`, which means commands can read any file on
+disk, but attempts to write a file or access the network will be blocked.
+
+A more relaxed policy is `workspace-write`. When specified, the current working directory for the Codex task will be writable (as well as `$TMPDIR` on macOS). Note that the CLI defaults to using the directory where it was spawned as `cwd`, though this can be overridden using `--cwd/-C`.
 
 ```toml
-[sandbox]
-mode = "workspace-write"
+# same as `--sandbox workspace-write`
+sandbox_mode = "workspace-write"
 
-# By default, only the cwd for the Codex session will be writable (and $TMPDIR on macOS),
-# but you can specify additional writable folders in this array.
-writable_roots = [
-    "/tmp",
-]
-network_access = false  # Like read-only, this also defaults to false and can be omitted.
+# Extra settings that only apply when `sandbox = "workspace-write"`.
+[sandbox_workspace_write]
+# By default, only the cwd for the Codex session will be writable (and $TMPDIR
+# on macOS), but you can specify additional writable folders in this array.
+writable_roots = ["/tmp"]
+# Allow the command being run inside the sandbox to make outbound network
+# requests. Disabled by default.
+network_access = false
 ```
 
 To disable sandboxing altogether, specify `danger-full-access` like so:
 
 ```toml
-[sandbox]
-mode = "danger-full-access"
+# same as `--sandbox danger-full-access`
+sandbox_mode = "danger-full-access"
 ```
 
 This is reasonable to use if Codex is running in an environment that provides its own sandboxing (such as a Docker container) such that further sandboxing is unnecessary.
