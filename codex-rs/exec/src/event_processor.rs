@@ -139,7 +139,7 @@ impl EventProcessor {
             ("sandbox", summarize_sandbox_policy(&config.sandbox_policy)),
         ];
         if config.model_provider.wire_api == WireApi::Responses
-            && model_supports_reasoning_summaries(&config.model)
+            && model_supports_reasoning_summaries(config)
         {
             entries.push((
                 "reasoning effort",
@@ -415,7 +415,7 @@ impl EventProcessor {
                 {
                     (
                         format!(" in {}", format_elapsed(start_time)),
-                        format!("apply_patch(auto_approved={})", auto_approved),
+                        format!("apply_patch(auto_approved={auto_approved})"),
                     )
                 } else {
                     (String::new(), format!("apply_patch('{call_id}')"))
