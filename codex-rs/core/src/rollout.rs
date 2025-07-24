@@ -14,7 +14,9 @@ use time::macros::format_description;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
+use tokio::sync::oneshot;
 use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -30,9 +32,7 @@ pub struct SessionMeta {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
-pub struct SessionStateSnapshot {
-    pub previous_response_id: Option<String>,
-}
+pub struct SessionStateSnapshot {}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct SavedSession {
@@ -58,10 +58,10 @@ pub(crate) struct RolloutRecorder {
     tx: Sender<RolloutCmd>,
 }
 
-#[derive(Clone)]
 enum RolloutCmd {
     AddItems(Vec<ResponseItem>),
     UpdateState(SessionStateSnapshot),
+    Shutdown { ack: oneshot::Sender<()> },
 }
 
 impl RolloutRecorder {
@@ -119,8 +119,9 @@ impl RolloutRecorder {
                 ResponseItem::Message { .. }
                 | ResponseItem::LocalShellCall { .. }
                 | ResponseItem::FunctionCall { .. }
-                | ResponseItem::FunctionCallOutput { .. } => filtered.push(item.clone()),
-                ResponseItem::Reasoning { .. } | ResponseItem::Other => {
+                | ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::Reasoning { .. } => filtered.push(item.clone()),
+                ResponseItem::Other => {
                     // These should never be serialized.
                     continue;
                 }
@@ -172,13 +173,17 @@ impl RolloutRecorder {
                 }
                 continue;
             }
-            if let Ok(item) = serde_json::from_value::<ResponseItem>(v.clone()) {
-                match item {
+            match serde_json::from_value::<ResponseItem>(v.clone()) {
+                Ok(item) => match item {
                     ResponseItem::Message { .. }
                     | ResponseItem::LocalShellCall { .. }
                     | ResponseItem::FunctionCall { .. }
-                    | ResponseItem::FunctionCallOutput { .. } => items.push(item),
-                    ResponseItem::Reasoning { .. } | ResponseItem::Other => {}
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::Reasoning { .. } => items.push(item),
+                    ResponseItem::Other => {}
+                },
+                Err(e) => {
+                    warn!("failed to parse item: {v:?}, error: {e}");
                 }
             }
         }
@@ -199,6 +204,21 @@ impl RolloutRecorder {
         tokio::task::spawn(rollout_writer(tokio::fs::File::from_std(file), rx, None));
         info!("Resumed rollout successfully from {path:?}");
         Ok((Self { tx }, saved))
+    }
+
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        let (tx_done, rx_done) = oneshot::channel();
+        match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
+            Ok(_) => rx_done
+                .await
+                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}"))),
+            Err(e) => {
+                warn!("failed to send rollout shutdown command: {e}");
+                Err(IoError::other(format!(
+                    "failed to send rollout shutdown command: {e}"
+                )))
+            }
+        }
     }
 }
 
@@ -267,13 +287,14 @@ async fn rollout_writer(
                         ResponseItem::Message { .. }
                         | ResponseItem::LocalShellCall { .. }
                         | ResponseItem::FunctionCall { .. }
-                        | ResponseItem::FunctionCallOutput { .. } => {
+                        | ResponseItem::FunctionCallOutput { .. }
+                        | ResponseItem::Reasoning { .. } => {
                             if let Ok(json) = serde_json::to_string(&item) {
                                 let _ = file.write_all(json.as_bytes()).await;
                                 let _ = file.write_all(b"\n").await;
                             }
                         }
-                        ResponseItem::Reasoning { .. } | ResponseItem::Other => {}
+                        ResponseItem::Other => {}
                     }
                 }
                 let _ = file.flush().await;
@@ -293,6 +314,9 @@ async fn rollout_writer(
                     let _ = file.write_all(b"\n").await;
                     let _ = file.flush().await;
                 }
+            }
+            RolloutCmd::Shutdown { ack } => {
+                let _ = ack.send(());
             }
         }
     }

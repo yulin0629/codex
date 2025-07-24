@@ -116,6 +116,9 @@ pub enum Op {
 
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
+
+    /// Request to shut down codex instance.
+    Shutdown,
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -326,6 +329,9 @@ pub enum EventMsg {
 
     /// Response to GetHistoryEntryRequest.
     GetHistoryEntryResponse(GetHistoryEntryResponseEvent),
+
+    /// Notification that the agent is shutting down.
+    ShutdownComplete,
 }
 
 // Individual event payload types matching each `EventMsg` variant.
@@ -422,6 +428,8 @@ pub struct ExecCommandEndEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExecApprovalRequestEvent {
+    /// Identifier for the associated exec call, if available.
+    pub call_id: String,
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory.
@@ -433,6 +441,8 @@ pub struct ExecApprovalRequestEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApplyPatchApprovalRequestEvent {
+    /// Responses API call id for the associated patch apply call, if available.
+    pub call_id: String,
     pub changes: HashMap<PathBuf, FileChange>,
     /// Optional explanatory reason (e.g. request for extra write access).
     #[serde(skip_serializing_if = "Option::is_none")]
