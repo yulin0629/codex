@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codex_core::Codex;
+use codex_core::CodexConversation;
 use codex_core::protocol::Op;
 use codex_core::protocol::ReviewDecision;
 use mcp_types::ElicitRequest;
@@ -18,7 +18,7 @@ use crate::codex_tool_runner::INVALID_PARAMS_ERROR_CODE;
 
 /// Conforms to [`mcp_types::ElicitRequestParams`] so that it can be used as the
 /// `params` field of an [`ElicitRequest`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExecApprovalElicitRequestParams {
     // These fields are required so that `params`
     // conforms to ElicitRequestParams.
@@ -51,7 +51,7 @@ pub(crate) async fn handle_exec_approval_request(
     command: Vec<String>,
     cwd: PathBuf,
     outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
-    codex: Arc<Codex>,
+    codex: Arc<CodexConversation>,
     request_id: RequestId,
     tool_call_id: String,
     event_id: String,
@@ -116,7 +116,7 @@ pub(crate) async fn handle_exec_approval_request(
 async fn on_exec_approval_response(
     event_id: String,
     receiver: tokio::sync::oneshot::Receiver<mcp_types::Result>,
-    codex: Arc<Codex>,
+    codex: Arc<CodexConversation>,
 ) {
     let response = receiver.await;
     let value = match response {

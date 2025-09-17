@@ -5,11 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use strum_macros::Display;
 use wildmatch::WildMatchPattern;
 
 use serde::Deserialize;
-use serde::Serialize;
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
@@ -20,6 +18,10 @@ pub struct McpServerConfig {
 
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+
+    /// Startup timeout in milliseconds for initializing MCP server & initially listing tools.
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Copy, Clone, PartialEq)]
@@ -74,30 +76,48 @@ pub enum HistoryPersistence {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Notifications {
+    Enabled(bool),
+    Custom(Vec<String>),
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self::Enabled(false)
+    }
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-pub struct Tui {}
-
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxMode {
-    #[serde(rename = "read-only")]
-    #[default]
-    ReadOnly,
-
-    #[serde(rename = "workspace-write")]
-    WorkspaceWrite,
-
-    #[serde(rename = "danger-full-access")]
-    DangerFullAccess,
+pub struct Tui {
+    /// Enable desktop notifications from the TUI when the terminal is unfocused.
+    /// Defaults to `false`.
+    pub notifications: Notifications,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-pub struct SandboxWorkplaceWrite {
+pub struct SandboxWorkspaceWrite {
     #[serde(default)]
     pub writable_roots: Vec<PathBuf>,
     #[serde(default)]
     pub network_access: bool,
+    #[serde(default)]
+    pub exclude_tmpdir_env_var: bool,
+    #[serde(default)]
+    pub exclude_slash_tmp: bool,
+}
+
+impl From<SandboxWorkspaceWrite> for codex_protocol::mcp_protocol::SandboxSettings {
+    fn from(sandbox_workspace_write: SandboxWorkspaceWrite) -> Self {
+        Self {
+            writable_roots: sandbox_workspace_write.writable_roots,
+            network_access: Some(sandbox_workspace_write.network_access),
+            exclude_tmpdir_env_var: Some(sandbox_workspace_write.exclude_tmpdir_env_var),
+            exclude_slash_tmp: Some(sandbox_workspace_write.exclude_slash_tmp),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
@@ -105,10 +125,10 @@ pub struct SandboxWorkplaceWrite {
 pub enum ShellEnvironmentPolicyInherit {
     /// "Core" environment variables for the platform. On UNIX, this would
     /// include HOME, LOGNAME, PATH, SHELL, and USER, among others.
-    #[default]
     Core,
 
     /// Inherits the full environment from the parent process.
+    #[default]
     All,
 
     /// Do not inherit any environment variables from the parent process.
@@ -167,7 +187,8 @@ pub struct ShellEnvironmentPolicy {
 
 impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
     fn from(toml: ShellEnvironmentPolicyToml) -> Self {
-        let inherit = toml.inherit.unwrap_or(ShellEnvironmentPolicyInherit::Core);
+        // Default to inheriting the full environment when not specified.
+        let inherit = toml.inherit.unwrap_or(ShellEnvironmentPolicyInherit::All);
         let ignore_default_excludes = toml.ignore_default_excludes.unwrap_or(false);
         let exclude = toml
             .exclude
@@ -195,30 +216,10 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
     }
 }
 
-/// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
-#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningSummaryFormat {
     #[default]
-    Medium,
-    High,
-    /// Option to disable reasoning.
     None,
-}
-
-/// A summary of the reasoning performed by the model. This can be useful for
-/// debugging and understanding the model's reasoning process.
-/// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries
-#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum ReasoningSummary {
-    #[default]
-    Auto,
-    Concise,
-    Detailed,
-    /// Option to disable reasoning summaries.
-    None,
+    Experimental,
 }

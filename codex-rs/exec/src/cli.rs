@@ -6,6 +6,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Cli {
+    /// Action to perform. If omitted, runs a new non-interactive session.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Optional image(s) to attach to the initial prompt.
     #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
     pub images: Vec<PathBuf>,
@@ -14,9 +18,12 @@ pub struct Cli {
     #[arg(long, short = 'm')]
     pub model: Option<String>,
 
+    #[arg(long = "oss", default_value_t = false)]
+    pub oss: bool,
+
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
-    #[arg(long = "sandbox", short = 's')]
+    #[arg(long = "sandbox", short = 's', value_enum)]
     pub sandbox_mode: Option<codex_common::SandboxModeCliArg>,
 
     /// Configuration profile from config.toml to specify default options.
@@ -31,6 +38,7 @@ pub struct Cli {
     /// EXTREMELY DANGEROUS. Intended solely for running in environments that are externally sandboxed.
     #[arg(
         long = "dangerously-bypass-approvals-and-sandbox",
+        alias = "yolo",
         default_value_t = false,
         conflicts_with = "full_auto"
     )]
@@ -61,6 +69,28 @@ pub struct Cli {
 
     /// Initial instructions for the agent. If not provided as an argument (or
     /// if `-` is used), instructions are read from stdin.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Resume a previous session by id or pick the most recent with --last.
+    Resume(ResumeArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ResumeArgs {
+    /// Conversation/session id (UUID). When provided, resumes this session.
+    /// If omitted, use --last to pick the most recent recorded session.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+
+    /// Resume the most recent recorded session (newest) without specifying an id.
+    #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
+    pub last: bool,
+
+    /// Prompt to send after resuming the session. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT")]
     pub prompt: Option<String>,
 }

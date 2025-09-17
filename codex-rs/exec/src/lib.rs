@@ -6,21 +6,23 @@ mod event_processor_with_json_output;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub use cli::Cli;
-use codex_core::codex_wrapper::CodexConversation;
-use codex_core::codex_wrapper::{self};
+use codex_core::AuthManager;
+use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
+use codex_core::ConversationManager;
+use codex_core::NewConversation;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
-use codex_core::config_types::SandboxMode;
+use codex_core::git_info::get_git_repo_root;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
 use codex_core::protocol::TaskCompleteEvent;
-use codex_core::util::is_inside_git_repo;
+use codex_ollama::DEFAULT_OSS_MODEL;
+use codex_protocol::config_types::SandboxMode;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_json_output::EventProcessorWithJsonOutput;
 use tracing::debug;
@@ -28,13 +30,17 @@ use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::cli::Command as ExecCommand;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use codex_core::find_conversation_path_by_id_str;
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     let Cli {
+        command,
         images,
-        model,
+        model: model_cli_arg,
+        oss,
         config_profile,
         full_auto,
         dangerously_bypass_approvals_and_sandbox,
@@ -48,8 +54,15 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         config_overrides,
     } = cli;
 
-    // Determine the prompt based on CLI arg and/or stdin.
-    let prompt = match prompt {
+    // Determine the prompt source (parent or subcommand) and read from stdin if needed.
+    let prompt_arg = match &command {
+        // Allow prompt before the subcommand by falling back to the parent-level prompt
+        // when the Resume subcommand did not provide its own prompt.
+        Some(ExecCommand::Resume(args)) => args.prompt.clone().or(prompt),
+        None => prompt,
+    };
+
+    let prompt = match prompt_arg {
         Some(p) if p != "-" => p,
         // Either `-` was passed or no positional arg.
         maybe_dash => {
@@ -114,19 +127,41 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         sandbox_mode_cli_arg.map(Into::<SandboxMode>::into)
     };
 
+    // When using `--oss`, let the bootstrapper pick the model (defaulting to
+    // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
+    // `oss` model provider.
+    let model = if let Some(model) = model_cli_arg {
+        Some(model)
+    } else if oss {
+        Some(DEFAULT_OSS_MODEL.to_owned())
+    } else {
+        None // No model specified, will use the default.
+    };
+
+    let model_provider = if oss {
+        Some(BUILT_IN_OSS_MODEL_PROVIDER_ID.to_string())
+    } else {
+        None // No specific model provider override.
+    };
+
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
+        review_model: None,
         config_profile,
         // This CLI is intended to be headless and has no affordances for asking
         // the user for approval.
         approval_policy: Some(AskForApproval::Never),
         sandbox_mode,
         cwd: cwd.map(|p| p.canonicalize().unwrap_or(p)),
-        model_provider: None,
+        model_provider,
         codex_linux_sandbox_exe,
         base_instructions: None,
         include_plan_tool: None,
+        include_apply_patch_tool: None,
+        include_view_image_tool: None,
+        show_raw_agent_reasoning: oss.then_some(true),
+        tools_web_search_request: None,
     };
     // Parse `-c` overrides.
     let cli_kv_overrides = match config_overrides.parse_overrides() {
@@ -148,48 +183,74 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         ))
     };
 
+    if oss {
+        codex_ollama::ensure_oss_ready(&config)
+            .await
+            .map_err(|e| anyhow::anyhow!("OSS setup failed: {e}"))?;
+    }
+
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt);
 
-    if !skip_git_repo_check && !is_inside_git_repo(&config) {
-        eprintln!("Not inside a Git repo and --skip-git-repo-check was not specified.");
+    if !skip_git_repo_check && get_git_repo_root(&config.cwd.to_path_buf()).is_none() {
+        eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
         std::process::exit(1);
     }
 
-    let CodexConversation {
-        codex: codex_wrapper,
+    let conversation_manager =
+        ConversationManager::new(AuthManager::shared(config.codex_home.clone()));
+
+    // Handle resume subcommand by resolving a rollout path and using explicit resume API.
+    let NewConversation {
+        conversation_id: _,
+        conversation,
         session_configured,
-        ctrl_c,
-        ..
-    } = codex_wrapper::init_codex(config).await?;
-    let codex = Arc::new(codex_wrapper);
+    } = if let Some(ExecCommand::Resume(args)) = command {
+        let resume_path = resolve_resume_path(&config, &args).await?;
+
+        if let Some(path) = resume_path {
+            conversation_manager
+                .resume_conversation_from_rollout(
+                    config.clone(),
+                    path,
+                    AuthManager::shared(config.codex_home.clone()),
+                )
+                .await?
+        } else {
+            conversation_manager.new_conversation(config).await?
+        }
+    } else {
+        conversation_manager.new_conversation(config).await?
+    };
     info!("Codex initialized with event: {session_configured:?}");
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     {
-        let codex = codex.clone();
+        let conversation = conversation.clone();
         tokio::spawn(async move {
             loop {
-                let interrupted = ctrl_c.notified();
                 tokio::select! {
-                    _ = interrupted => {
-                        // Forward an interrupt to the codex so it can abort any in‑flight task.
-                        let _ = codex
-                            .submit(
-                                Op::Interrupt,
-                            )
-                            .await;
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::debug!("Keyboard interrupt");
+                        // Immediately notify Codex to abort any in‑flight task.
+                        conversation.submit(Op::Interrupt).await.ok();
 
-                        // Exit the inner loop and return to the main input prompt.  The codex
+                        // Exit the inner loop and return to the main input prompt. The codex
                         // will emit a `TurnInterrupted` (Error) event which is drained later.
                         break;
                     }
-                    res = codex.next_event() => match res {
+                    res = conversation.next_event() => match res {
                         Ok(event) => {
                             debug!("Received event: {event:?}");
+
+                            let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
                             if let Err(e) = tx.send(event) {
                                 error!("Error sending event: {e:?}");
+                                break;
+                            }
+                            if is_shutdown_complete {
+                                info!("Received shutdown event, exiting event loop.");
                                 break;
                             }
                         },
@@ -209,9 +270,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             .into_iter()
             .map(|path| InputItem::LocalImage { path })
             .collect();
-        let initial_images_event_id = codex.submit(Op::UserInput { items }).await?;
+        let initial_images_event_id = conversation.submit(Op::UserInput { items }).await?;
         info!("Sent images with event ID: {initial_images_event_id}");
-        while let Ok(event) = codex.next_event().await {
+        while let Ok(event) = conversation.next_event().await {
             if event.id == initial_images_event_id
                 && matches!(
                     event.msg,
@@ -227,7 +288,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Send the prompt.
     let items: Vec<InputItem> = vec![InputItem::Text { text: prompt }];
-    let initial_prompt_task_id = codex.submit(Op::UserInput { items }).await?;
+    let initial_prompt_task_id = conversation.submit(Op::UserInput { items }).await?;
     info!("Sent prompt with event ID: {initial_prompt_task_id}");
 
     // Run the loop until the task is complete.
@@ -236,7 +297,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         match shutdown {
             CodexStatus::Running => continue,
             CodexStatus::InitiateShutdown => {
-                codex.submit(Op::Shutdown).await?;
+                conversation.submit(Op::Shutdown).await?;
             }
             CodexStatus::Shutdown => {
                 break;
@@ -245,4 +306,24 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     Ok(())
+}
+
+async fn resolve_resume_path(
+    config: &Config,
+    args: &crate::cli::ResumeArgs,
+) -> anyhow::Result<Option<PathBuf>> {
+    if args.last {
+        match codex_core::RolloutRecorder::list_conversations(&config.codex_home, 1, None).await {
+            Ok(page) => Ok(page.items.first().map(|it| it.path.clone())),
+            Err(e) => {
+                error!("Error listing conversations: {e}");
+                Ok(None)
+            }
+        }
+    } else if let Some(id_str) = args.session_id.as_deref() {
+        let path = find_conversation_path_by_id_str(&config.codex_home, id_str).await?;
+        Ok(path)
+    } else {
+        Ok(None)
+    }
 }

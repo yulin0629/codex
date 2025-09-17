@@ -9,8 +9,8 @@ use serde_json::json;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::event_processor::create_config_summary_entries;
 use crate::event_processor::handle_last_message;
+use codex_common::create_config_summary_entries;
 
 pub(crate) struct EventProcessorWithJsonOutput {
     last_message_path: Option<PathBuf>,
@@ -28,7 +28,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect::<HashMap<String, String>>();
-        #[allow(clippy::expect_used)]
+        #[expect(clippy::expect_used)]
         let config_json =
             serde_json::to_string(&entries).expect("Failed to serialize config summary to JSON");
         println!("{config_json}");
@@ -46,10 +46,9 @@ impl EventProcessor for EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
-                handle_last_message(
-                    last_agent_message.as_deref(),
-                    self.last_message_path.as_deref(),
-                );
+                if let Some(output_file) = self.last_message_path.as_deref() {
+                    handle_last_message(last_agent_message.as_deref(), output_file);
+                }
                 CodexStatus::InitiateShutdown
             }
             EventMsg::ShutdownComplete => CodexStatus::Shutdown,
