@@ -12,7 +12,7 @@ export type {
 } from "./events";
 export type {
   ThreadItem,
-  AssistantMessageItem,
+  AgentMessageItem,
   ReasoningItem,
   CommandExecutionItem,
   FileChangeItem,
@@ -29,4 +29,4 @@ export { Codex } from "./codex";
 
 export type { CodexOptions } from "./codexOptions";
 
-export type { TurnOptions, ApprovalMode, SandboxMode } from "./turnOptions";
+export type { ThreadOptions as TheadOptions, ApprovalMode, SandboxMode } from "./threadOptions";
