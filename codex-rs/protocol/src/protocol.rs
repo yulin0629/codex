@@ -171,6 +171,11 @@ pub enum Op {
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
 
+    /// Set a human-friendly name for the current session.
+    /// The agent will persist this to the rollout as an event so that UIs can
+    /// surface it when listing sessions.
+    SetSessionName { name: String },
+
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
@@ -457,6 +462,9 @@ pub enum EventMsg {
     AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent),
     /// Signaled when the model begins a new reasoning summary section (e.g., a new titled block).
     AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent),
+
+    /// Session was given a human-friendly name by the user.
+    SessionRenamed(SessionRenamedEvent),
 
     /// Ack the client's configure message.
     SessionConfigured(SessionConfiguredEvent),
@@ -895,6 +903,11 @@ pub struct WebSearchEndEvent {
     pub query: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SessionRenamedEvent {
+    pub name: String,
+}
+
 /// Response payload for `Op::GetHistory` containing the current session's
 /// in-memory transcript.
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1243,6 +1256,30 @@ pub struct GetHistoryEntryResponseEvent {
 pub struct McpListToolsResponseEvent {
     /// Fully qualified tool name -> tool definition.
     pub tools: std::collections::HashMap<String, McpTool>,
+    /// Authentication status for each configured MCP server.
+    pub auth_statuses: std::collections::HashMap<String, McpAuthStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum McpAuthStatus {
+    Unsupported,
+    NotLoggedIn,
+    BearerToken,
+    OAuth,
+}
+
+impl fmt::Display for McpAuthStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            McpAuthStatus::Unsupported => "Unsupported",
+            McpAuthStatus::NotLoggedIn => "Not logged in",
+            McpAuthStatus::BearerToken => "Bearer token",
+            McpAuthStatus::OAuth => "OAuth",
+        };
+        f.write_str(text)
+    }
 }
 
 /// Response payload for `Op::ListCustomPrompts`.
