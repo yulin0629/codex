@@ -42,7 +42,8 @@ use codex_core::config::ConfigOverrides;
     // The executable is sometimes invoked via a platform‑specific name like
     // `codex-x86_64-unknown-linux-musl`, but the help output should always use
     // the generic `codex` command name that users run.
-    bin_name = "codex"
+    bin_name = "codex",
+    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -562,6 +563,9 @@ fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
     }
     if !resume_cli.images.is_empty() {
         interactive.images = resume_cli.images;
+    }
+    if !resume_cli.add_dir.is_empty() {
+        interactive.add_dir.extend(resume_cli.add_dir);
     }
     if let Some(prompt) = resume_cli.prompt {
         interactive.prompt = Some(prompt);
