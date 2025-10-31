@@ -73,8 +73,8 @@ use codex_core::auth::login_with_api_key;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
-use codex_core::config::load_config_as_toml;
-use codex_core::config_edit::ConfigEditsBuilder;
+use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config_loader::load_config_as_toml;
 use codex_core::default_client::get_codex_user_agent;
 use codex_core::exec::ExecParams;
 use codex_core::exec_env::create_env;
@@ -1760,6 +1760,8 @@ async fn derive_config_from_params(
         sandbox: sandbox_mode,
         config: cli_overrides,
         base_instructions,
+        developer_instructions,
+        compact_prompt,
         include_apply_patch_tool,
     } = params;
     let overrides = ConfigOverrides {
@@ -1772,8 +1774,9 @@ async fn derive_config_from_params(
         model_provider,
         codex_linux_sandbox_exe,
         base_instructions,
+        developer_instructions,
+        compact_prompt,
         include_apply_patch_tool,
-        include_view_image_tool: None,
         show_raw_agent_reasoning: None,
         tools_web_search_request: None,
         experimental_sandbox_command_assessment: None,
