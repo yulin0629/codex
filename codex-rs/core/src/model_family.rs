@@ -1,3 +1,6 @@
+use codex_protocol::config_types::ReasoningEffort;
+use codex_protocol::config_types::Verbosity;
+
 use crate::config::types::ReasoningSummaryFormat;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::spec::ConfigShellToolType;
@@ -29,6 +32,9 @@ pub struct ModelFamily {
     // `summary` is optional).
     pub supports_reasoning_summaries: bool,
 
+    // The reasoning effort to use for this model family when none is explicitly chosen.
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+
     // Define if we need a special handling of reasoning summary
     pub reasoning_summary_format: ReasoningSummaryFormat,
 
@@ -55,6 +61,9 @@ pub struct ModelFamily {
     /// If the model family supports setting the verbosity level when using Responses API.
     pub support_verbosity: bool,
 
+    // The default verbosity level for this model family when using Responses API.
+    pub default_verbosity: Option<Verbosity>,
+
     /// Preferred shell tool type for this model family when features do not override it.
     pub shell_type: ConfigShellToolType,
 }
@@ -78,7 +87,10 @@ macro_rules! model_family {
             effective_context_window_percent: 95,
             support_verbosity: false,
             shell_type: ConfigShellToolType::Default,
+            default_verbosity: None,
+            default_reasoning_effort: None,
         };
+
         // apply overrides
         $(
             mf.$key = $value;
@@ -120,8 +132,6 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
         model_family!(slug, "gpt-4o", needs_special_apply_patch_instructions: true)
     } else if slug.starts_with("gpt-3.5") {
         model_family!(slug, "gpt-3.5", needs_special_apply_patch_instructions: true)
-    } else if slug.starts_with("porcupine") {
-        model_family!(slug, "porcupine", shell_type: ConfigShellToolType::UnifiedExec)
     } else if slug.starts_with("test-gpt-5-codex") {
         model_family!(
             slug, slug,
@@ -174,7 +184,9 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             supports_reasoning_summaries: true,
             apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
             support_verbosity: true,
+            default_verbosity: Some(Verbosity::Low),
             base_instructions: GPT_5_1_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
         )
     } else if slug.starts_with("gpt-5") {
         model_family!(
@@ -202,5 +214,7 @@ pub fn derive_default_model_family(model: &str) -> ModelFamily {
         effective_context_window_percent: 95,
         support_verbosity: false,
         shell_type: ConfigShellToolType::Default,
+        default_verbosity: None,
+        default_reasoning_effort: None,
     }
 }
