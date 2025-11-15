@@ -63,10 +63,8 @@ impl UnifiedExecContext {
 }
 
 #[derive(Debug)]
-pub(crate) struct ExecCommandRequest<'a> {
-    pub command: &'a str,
-    pub shell: &'a str,
-    pub login: bool,
+pub(crate) struct ExecCommandRequest {
+    pub command: Vec<String>,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub workdir: Option<PathBuf>,
@@ -76,6 +74,7 @@ pub(crate) struct ExecCommandRequest<'a> {
 
 #[derive(Debug)]
 pub(crate) struct WriteStdinRequest<'a> {
+    pub call_id: &'a str,
     pub session_id: i32,
     pub input: &'a str,
     pub yield_time_ms: u64,
@@ -91,6 +90,7 @@ pub(crate) struct UnifiedExecResponse {
     pub session_id: Option<i32>,
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
+    pub session_command: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -104,7 +104,7 @@ struct SessionEntry {
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
     call_id: String,
-    command: String,
+    command: Vec<String>,
     cwd: PathBuf,
     started_at: tokio::time::Instant,
 }
@@ -193,9 +193,7 @@ mod tests {
             .unified_exec_manager
             .exec_command(
                 ExecCommandRequest {
-                    command: cmd,
-                    shell: "/bin/bash",
-                    login: true,
+                    command: vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()],
                     yield_time_ms,
                     max_output_tokens: None,
                     workdir: None,
@@ -217,6 +215,7 @@ mod tests {
             .services
             .unified_exec_manager
             .write_stdin(WriteStdinRequest {
+                call_id: "write-stdin",
                 session_id,
                 input,
                 yield_time_ms,
