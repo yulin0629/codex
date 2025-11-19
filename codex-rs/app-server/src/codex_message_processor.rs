@@ -60,6 +60,8 @@ use codex_app_server_protocol::RemoveConversationSubscriptionResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ResumeConversationParams;
 use codex_app_server_protocol::ResumeConversationResponse;
+use codex_app_server_protocol::ReviewStartParams;
+use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SendUserMessageParams;
 use codex_app_server_protocol::SendUserMessageResponse;
@@ -115,6 +117,7 @@ use codex_core::git_info::git_diff_to_remote;
 use codex_core::parse_cursor;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
+use codex_core::protocol::ReviewRequest;
 use codex_core::read_head_for_summary;
 use codex_feedback::CodexFeedback;
 use codex_login::ServerOptions as LoginServerOptions;
@@ -158,8 +161,8 @@ struct ActiveLogin {
     login_id: Uuid,
 }
 
-impl ActiveLogin {
-    fn drop(&self) {
+impl Drop for ActiveLogin {
+    fn drop(&mut self) {
         self.shutdown_handle.shutdown();
     }
 }
@@ -232,6 +235,91 @@ impl CodexMessageProcessor {
         }
     }
 
+    fn review_request_from_target(
+        target: ReviewTarget,
+        append_to_original_thread: bool,
+    ) -> Result<(ReviewRequest, String), JSONRPCErrorError> {
+        fn invalid_request(message: String) -> JSONRPCErrorError {
+            JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message,
+                data: None,
+            }
+        }
+
+        match target {
+            // TODO(jif) those messages will be extracted in a follow-up PR.
+            ReviewTarget::UncommittedChanges => Ok((
+                ReviewRequest {
+                    prompt: "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".to_string(),
+                    user_facing_hint: "current changes".to_string(),
+                    append_to_original_thread,
+                },
+                "Review uncommitted changes".to_string(),
+            )),
+            ReviewTarget::BaseBranch { branch } => {
+                let branch = branch.trim().to_string();
+                if branch.is_empty() {
+                    return Err(invalid_request("branch must not be empty".to_string()));
+                }
+                let prompt = format!("Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings.");
+                let hint = format!("changes against '{branch}'");
+                let display = format!("Review changes against base branch '{branch}'");
+                Ok((
+                    ReviewRequest {
+                        prompt,
+                        user_facing_hint: hint,
+                        append_to_original_thread,
+                    },
+                    display,
+                ))
+            }
+            ReviewTarget::Commit { sha, title } => {
+                let sha = sha.trim().to_string();
+                if sha.is_empty() {
+                    return Err(invalid_request("sha must not be empty".to_string()));
+                }
+                let brief_title = title
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                let prompt = if let Some(title) = brief_title.clone() {
+                    format!("Review the code changes introduced by commit {sha} (\"{title}\"). Provide prioritized, actionable findings.")
+                } else {
+                    format!("Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.")
+                };
+                let short_sha = sha.chars().take(7).collect::<String>();
+                let hint = format!("commit {short_sha}");
+                let display = if let Some(title) = brief_title {
+                    format!("Review commit {short_sha}: {title}")
+                } else {
+                    format!("Review commit {short_sha}")
+                };
+                Ok((
+                    ReviewRequest {
+                        prompt,
+                        user_facing_hint: hint,
+                        append_to_original_thread,
+                    },
+                    display,
+                ))
+            }
+            ReviewTarget::Custom { instructions } => {
+                let trimmed = instructions.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(invalid_request("instructions must not be empty".to_string()));
+                }
+                Ok((
+                    ReviewRequest {
+                        prompt: trimmed.clone(),
+                        user_facing_hint: trimmed.clone(),
+                        append_to_original_thread,
+                    },
+                    trimmed,
+                ))
+            }
+        }
+    }
+
     pub async fn process_request(&mut self, request: ClientRequest) {
         match request {
             ClientRequest::Initialize { .. } => {
@@ -262,6 +350,9 @@ impl CodexMessageProcessor {
             }
             ClientRequest::TurnInterrupt { request_id, params } => {
                 self.turn_interrupt(request_id, params).await;
+            }
+            ClientRequest::ReviewStart { request_id, params } => {
+                self.review_start(request_id, params).await;
             }
             ClientRequest::NewConversation { request_id, params } => {
                 // Do not tokio::spawn() to process new_conversation()
@@ -417,7 +508,7 @@ impl CodexMessageProcessor {
         {
             let mut guard = self.active_login.lock().await;
             if let Some(active) = guard.take() {
-                active.drop();
+                drop(active);
             }
         }
 
@@ -525,7 +616,7 @@ impl CodexMessageProcessor {
                     {
                         let mut guard = self.active_login.lock().await;
                         if let Some(existing) = guard.take() {
-                            existing.drop();
+                            drop(existing);
                         }
                         *guard = Some(ActiveLogin {
                             shutdown_handle: shutdown_handle.clone(),
@@ -615,7 +706,7 @@ impl CodexMessageProcessor {
                     {
                         let mut guard = self.active_login.lock().await;
                         if let Some(existing) = guard.take() {
-                            existing.drop();
+                            drop(existing);
                         }
                         *guard = Some(ActiveLogin {
                             shutdown_handle: shutdown_handle.clone(),
@@ -704,7 +795,7 @@ impl CodexMessageProcessor {
         let mut guard = self.active_login.lock().await;
         if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
             if let Some(active) = guard.take() {
-                active.drop();
+                drop(active);
             }
             Ok(())
         } else {
@@ -758,7 +849,7 @@ impl CodexMessageProcessor {
         {
             let mut guard = self.active_login.lock().await;
             if let Some(active) = guard.take() {
-                active.drop();
+                drop(active);
             }
         }
 
@@ -1245,7 +1336,7 @@ impl CodexMessageProcessor {
                 // Auto-attach a conversation listener when starting a thread.
                 // Use the same behavior as the v1 API with experimental_raw_events=false.
                 if let Err(err) = self
-                    .attach_conversation_listener(conversation_id, false)
+                    .attach_conversation_listener(conversation_id, false, ApiVersion::V2)
                     .await
                 {
                     tracing::warn!(
@@ -1523,7 +1614,7 @@ impl CodexMessageProcessor {
             }) => {
                 // Auto-attach a conversation listener when resuming a thread.
                 if let Err(err) = self
-                    .attach_conversation_listener(conversation_id, false)
+                    .attach_conversation_listener(conversation_id, false, ApiVersion::V2)
                     .await
                 {
                     tracing::warn!(
@@ -2342,6 +2433,65 @@ impl CodexMessageProcessor {
         }
     }
 
+    async fn review_start(&self, request_id: RequestId, params: ReviewStartParams) {
+        let ReviewStartParams {
+            thread_id,
+            target,
+            append_to_original_thread,
+        } = params;
+        let (_, conversation) = match self.conversation_from_thread_id(&thread_id).await {
+            Ok(v) => v,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+
+        let (review_request, display_text) =
+            match Self::review_request_from_target(target, append_to_original_thread) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.outgoing.send_error(request_id, err).await;
+                    return;
+                }
+            };
+
+        let turn_id = conversation.submit(Op::Review { review_request }).await;
+
+        match turn_id {
+            Ok(turn_id) => {
+                let mut items = Vec::new();
+                if !display_text.is_empty() {
+                    items.push(ThreadItem::UserMessage {
+                        id: turn_id.clone(),
+                        content: vec![V2UserInput::Text { text: display_text }],
+                    });
+                }
+                let turn = Turn {
+                    id: turn_id.clone(),
+                    items,
+                    status: TurnStatus::InProgress,
+                    error: None,
+                };
+                let response = TurnStartResponse { turn: turn.clone() };
+                self.outgoing.send_response(request_id, response).await;
+
+                let notif = TurnStartedNotification { turn };
+                self.outgoing
+                    .send_server_notification(ServerNotification::TurnStarted(notif))
+                    .await;
+            }
+            Err(err) => {
+                let error = JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to start review: {err}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+            }
+        }
+    }
+
     async fn turn_interrupt(&mut self, request_id: RequestId, params: TurnInterruptParams) {
         let TurnInterruptParams { thread_id, .. } = params;
 
@@ -2376,7 +2526,7 @@ impl CodexMessageProcessor {
             experimental_raw_events,
         } = params;
         match self
-            .attach_conversation_listener(conversation_id, experimental_raw_events)
+            .attach_conversation_listener(conversation_id, experimental_raw_events, ApiVersion::V1)
             .await
         {
             Ok(subscription_id) => {
@@ -2417,6 +2567,7 @@ impl CodexMessageProcessor {
         &mut self,
         conversation_id: ConversationId,
         experimental_raw_events: bool,
+        api_version: ApiVersion,
     ) -> Result<Uuid, JSONRPCErrorError> {
         let conversation = match self
             .conversation_manager
@@ -2440,6 +2591,7 @@ impl CodexMessageProcessor {
 
         let outgoing_for_task = self.outgoing.clone();
         let pending_interrupts = self.pending_interrupts.clone();
+        let api_version_for_task = api_version;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2495,6 +2647,7 @@ impl CodexMessageProcessor {
                             conversation.clone(),
                             outgoing_for_task.clone(),
                             pending_interrupts.clone(),
+                            api_version_for_task,
                         )
                         .await;
                     }

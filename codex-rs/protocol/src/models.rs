@@ -132,6 +132,9 @@ pub enum ResponseItem {
     GhostSnapshot {
         ghost_commit: GhostCommit,
     },
+    CompactionSummary {
+        encrypted_content: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -379,7 +382,7 @@ impl Serialize for FunctionCallOutputPayload {
     where
         S: Serializer,
     {
-        tracing::error!("Payload: {:?}", self);
+        tracing::debug!("Function call output payload: {:?}", self);
         if let Some(items) = &self.content_items {
             items.serialize(serializer)
         } else {

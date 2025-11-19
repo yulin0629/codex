@@ -160,9 +160,9 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
     // with the OpenAI schema, so we just verify the tool presence here
     let tools_by_model: HashMap<&'static str, Vec<&'static str>> = HashMap::from([
         (
-            "gpt-5",
+            "gpt-5.1",
             vec![
-                "shell",
+                "shell_command",
                 "list_mcp_resources",
                 "list_mcp_resource_templates",
                 "read_mcp_resource",
@@ -173,19 +173,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         (
             "gpt-5.1",
             vec![
-                "shell",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "apply_patch",
-                "view_image",
-            ],
-        ),
-        (
-            "gpt-5-codex",
-            vec![
-                "shell",
+                "shell_command",
                 "list_mcp_resources",
                 "list_mcp_resource_templates",
                 "read_mcp_resource",
@@ -197,7 +185,19 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         (
             "gpt-5.1-codex",
             vec![
-                "shell",
+                "shell_command",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+                "update_plan",
+                "apply_patch",
+                "view_image",
+            ],
+        ),
+        (
+            "gpt-5.1-codex",
+            vec![
+                "shell_command",
                 "list_mcp_resources",
                 "list_mcp_resource_templates",
                 "read_mcp_resource",
