@@ -28,6 +28,7 @@ use crate::sandboxing::ExecEnv;
 use crate::sandboxing::SandboxManager;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use crate::text_encoding::bytes_to_string_smart;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
@@ -414,7 +415,7 @@ impl StreamOutput<String> {
 impl StreamOutput<Vec<u8>> {
     pub fn from_utf8_lossy(&self) -> StreamOutput<String> {
         StreamOutput {
-            text: String::from_utf8_lossy(&self.text).to_string(),
+            text: bytes_to_string_smart(&self.text),
             truncated_after_lines: self.truncated_after_lines,
         }
     }
@@ -780,6 +781,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()> {
+        // On Linux/macOS, /bin/bash is typically present; on FreeBSD/OpenBSD,
+        // prefer /bin/sh to avoid NotFound errors.
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 60 & echo $!; sleep 60".to_string(),
+        ];
+        #[cfg(all(unix, not(any(target_os = "freebsd", target_os = "openbsd"))))]
         let command = vec![
             "/bin/bash".to_string(),
             "-c".to_string(),
