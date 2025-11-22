@@ -22,6 +22,7 @@ use crate::posix::escalate_server::EscalateServer;
 use crate::posix::escalate_server::{self};
 use crate::posix::mcp_escalation_policy::ExecPolicy;
 use crate::posix::mcp_escalation_policy::McpEscalationPolicy;
+use crate::posix::stopwatch::Stopwatch;
 
 /// Path to our patched bash.
 const CODEX_BASH_PATH_ENV_VAR: &str = "CODEX_BASH_PATH";
@@ -40,6 +41,8 @@ pub struct ExecParams {
     pub workdir: String,
     /// The timeout for the command in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// Launch Bash with -lc instead of -c: defaults to true.
+    pub login: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -87,19 +90,20 @@ impl ExecTool {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ExecParams>,
     ) -> Result<CallToolResult, McpError> {
+        let effective_timeout = Duration::from_millis(
+            params
+                .timeout_ms
+                .unwrap_or(codex_core::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
+        );
+        let stopwatch = Stopwatch::new(effective_timeout);
+        let cancel_token = stopwatch.cancellation_token();
         let escalate_server = EscalateServer::new(
             self.bash_path.clone(),
             self.execve_wrapper.clone(),
-            McpEscalationPolicy::new(self.policy, context),
+            McpEscalationPolicy::new(self.policy, context, stopwatch.clone()),
         );
         let result = escalate_server
-            .exec(
-                params.command,
-                // TODO: use ShellEnvironmentPolicy
-                std::env::vars().collect(),
-                PathBuf::from(&params.workdir),
-                params.timeout_ms,
-            )
+            .exec(params, cancel_token)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::json(
@@ -138,4 +142,51 @@ pub(crate) async fn serve(
 ) -> Result<RunningService<RoleServer, ExecTool>, rmcp::service::ServerInitializeError> {
     let tool = ExecTool::new(bash_path, execve_wrapper, policy);
     tool.serve(stdio()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    /// Verify that the way we use serde does not compromise the desired JSON
+    /// schema via schemars. In particular, ensure that the `login` and
+    /// `timeout_ms` fields are optional.
+    #[test]
+    fn exec_params_json_schema_matches_expected() {
+        let schema = schemars::schema_for!(ExecParams);
+        let actual = serde_json::to_value(schema).expect("schema should serialize");
+
+        assert_eq!(
+            actual,
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": "ExecParams",
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "description": "The bash string to execute.",
+                        "type": "string"
+                    },
+                    "login": {
+                        "description": "Launch Bash with -lc instead of -c: defaults to true.",
+                        "type": ["boolean", "null"]
+                    },
+                    "timeout_ms": {
+                        "description": "The timeout for the command in milliseconds.",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": ["integer", "null"]
+                    },
+                    "workdir": {
+                        "description":
+                            "The working directory to execute the command in. Must be an absolute path.",
+                        "type": "string"
+                    }
+                },
+                "required": ["command", "workdir"]
+            })
+        );
+    }
 }
