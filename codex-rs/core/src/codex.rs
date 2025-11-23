@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
+use crate::SandboxState;
 use crate::client_common::REVIEW_PROMPT;
 use crate::compact;
 use crate::compact::run_inline_auto_compact_task;
@@ -614,6 +615,22 @@ impl Session {
             )
             .await;
 
+        let sandbox_state = SandboxState {
+            sandbox_policy: session_configuration.sandbox_policy.clone(),
+            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
+            sandbox_cwd: session_configuration.cwd.clone(),
+        };
+        if let Err(e) = sess
+            .services
+            .mcp_connection_manager
+            .read()
+            .await
+            .notify_sandbox_state_change(&sandbox_state)
+            .await
+        {
+            tracing::error!("Failed to notify sandbox state change: {e}");
+        }
+
         // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
         sess.record_initial_history(initial_history).await;
 
@@ -642,6 +659,11 @@ impl Session {
             .next_internal_sub_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         format!("auto-compact-{id}")
+    }
+
+    async fn get_total_token_usage(&self) -> i64 {
+        let state = self.state.lock().await;
+        state.get_total_token_usage()
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
@@ -1941,20 +1963,13 @@ pub(crate) async fn run_task(
         .await
         {
             Ok(turn_output) => {
-                let TurnRunResult {
-                    processed_items,
-                    total_token_usage,
-                } = turn_output;
+                let processed_items = turn_output;
                 let limit = turn_context
                     .client
                     .get_auto_compact_token_limit()
                     .unwrap_or(i64::MAX);
-                let total_usage_tokens = total_token_usage
-                    .as_ref()
-                    .map(TokenUsage::tokens_in_context_window);
-                let token_limit_reached = total_usage_tokens
-                    .map(|tokens| tokens >= limit)
-                    .unwrap_or(false);
+                let total_usage_tokens = sess.get_total_token_usage().await;
+                let token_limit_reached = total_usage_tokens >= limit;
                 let (responses, items_to_record_in_conversation_history) =
                     process_items(processed_items, &sess, &turn_context).await;
 
@@ -2011,7 +2026,7 @@ async fn run_turn(
     turn_diff_tracker: SharedTurnDiffTracker,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<TurnRunResult> {
+) -> CodexResult<Vec<ProcessedResponseItem>> {
     let mcp_tools = sess
         .services
         .mcp_connection_manager
@@ -2142,12 +2157,6 @@ pub struct ProcessedResponseItem {
     pub response: Option<ResponseInputItem>,
 }
 
-#[derive(Debug)]
-struct TurnRunResult {
-    processed_items: Vec<ProcessedResponseItem>,
-    total_token_usage: Option<TokenUsage>,
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn try_run_turn(
     router: Arc<ToolRouter>,
@@ -2156,7 +2165,7 @@ async fn try_run_turn(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
-) -> CodexResult<TurnRunResult> {
+) -> CodexResult<Vec<ProcessedResponseItem>> {
     let rollout_item = RolloutItem::TurnContext(TurnContextItem {
         cwd: turn_context.cwd.clone(),
         approval_policy: turn_context.approval_policy,
@@ -2318,12 +2327,7 @@ async fn try_run_turn(
                     sess.send_event(&turn_context, msg).await;
                 }
 
-                let result = TurnRunResult {
-                    processed_items,
-                    total_token_usage: token_usage.clone(),
-                };
-
-                return Ok(result);
+                return Ok(processed_items);
             }
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
