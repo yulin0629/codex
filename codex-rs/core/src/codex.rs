@@ -22,6 +22,7 @@ use crate::user_notification::UserNotifier;
 use crate::util::error_or_panic;
 use async_channel::Receiver;
 use async_channel::Sender;
+use codex_app_server_protocol::AuthMode;
 use codex_protocol::ConversationId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::FileChange;
@@ -126,12 +127,12 @@ use crate::util::backoff;
 use codex_async_utils::OrCancelExt;
 use codex_execpolicy::Policy as ExecPolicy;
 use codex_otel::otel_event_manager::OtelEventManager;
-use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
@@ -636,6 +637,14 @@ impl Session {
         sess.record_initial_history(initial_history).await;
 
         Ok(sess)
+    }
+
+    pub(crate) fn get_auth_mode(&self) -> AuthMode {
+        self.services
+            .auth_manager
+            .auth()
+            .map(|a| a.mode)
+            .unwrap_or(AuthMode::ApiKey)
     }
 
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
@@ -1478,6 +1487,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Review { review_request } => {
                 handlers::review(&sess, &config, sub.id.clone(), review_request).await;
             }
+            Op::ListModels => {
+                handlers::list_models(&sess, sub.id.clone(), Some(sess.get_auth_mode())).await;
+            }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
     }
@@ -1493,12 +1505,16 @@ mod handlers {
     use crate::codex::spawn_review_thread;
     use crate::config::Config;
     use crate::mcp::auth::compute_auth_statuses;
+    use crate::mcp::collect_mcp_snapshot_from_manager;
+    use crate::openai_models::model_presets::builtin_model_presets;
     use crate::review_prompts::resolve_review_request;
     use crate::tasks::CompactTask;
     use crate::tasks::RegularTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandTask;
+    use codex_app_server_protocol::AuthMode;
     use codex_protocol::custom_prompts::CustomPrompt;
+    use codex_protocol::openai_models::AvailableModelsEvent;
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
@@ -1689,30 +1705,18 @@ mod handlers {
 
     pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String) {
         let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
-        let (tools, auth_status_entries, resources, resource_templates) = tokio::join!(
-            mcp_connection_manager.list_all_tools(),
+        let snapshot = collect_mcp_snapshot_from_manager(
+            &mcp_connection_manager,
             compute_auth_statuses(
                 config.mcp_servers.iter(),
                 config.mcp_oauth_credentials_store_mode,
-            ),
-            mcp_connection_manager.list_all_resources(),
-            mcp_connection_manager.list_all_resource_templates(),
-        );
-        let auth_statuses = auth_status_entries
-            .iter()
-            .map(|(name, entry)| (name.clone(), entry.auth_status))
-            .collect();
+            )
+            .await,
+        )
+        .await;
         let event = Event {
             id: sub_id,
-            msg: EventMsg::McpListToolsResponse(crate::protocol::McpListToolsResponseEvent {
-                tools: tools
-                    .into_iter()
-                    .map(|(name, tool)| (name, tool.tool))
-                    .collect(),
-                resources,
-                resource_templates,
-                auth_statuses,
-            }),
+            msg: EventMsg::McpListToolsResponse(snapshot),
         };
         sess.send_event_raw(event).await;
     }
@@ -1824,6 +1828,15 @@ mod handlers {
                 sess.send_event(&turn_context, event.msg).await;
             }
         }
+    }
+
+    pub async fn list_models(sess: &Arc<Session>, sub_id: String, auth_mode: Option<AuthMode>) {
+        let models = builtin_model_presets(auth_mode);
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::ListModelsResponse(AvailableModelsEvent { models }),
+        };
+        sess.send_event_raw(event).await;
     }
 }
 
@@ -2039,6 +2052,13 @@ pub(crate) async fn run_task(
                 // Aborted turn is reported via a different event.
                 break;
             }
+            Err(CodexErr::InvalidImageRequest()) => {
+                let mut state = sess.state.lock().await;
+                error_or_panic(
+                    "Invalid image detected, replacing it in the last turn to prevent poisoning",
+                );
+                state.history.replace_last_turn_images("Invalid image");
+            }
             Err(e) => {
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
@@ -2146,6 +2166,8 @@ async fn run_turn(
             }
             Err(CodexErr::UsageNotIncluded) => return Err(CodexErr::UsageNotIncluded),
             Err(e @ CodexErr::QuotaExceeded) => return Err(e),
+            Err(e @ CodexErr::InvalidImageRequest()) => return Err(e),
+            Err(e @ CodexErr::InvalidRequest(_)) => return Err(e),
             Err(e @ CodexErr::RefreshTokenFailed(_)) => return Err(e),
             Err(e) => {
                 // Use the configured provider-specific stream retry budget.
