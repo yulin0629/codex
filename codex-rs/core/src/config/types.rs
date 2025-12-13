@@ -4,6 +4,7 @@
 // definitions that do not contain business logic.
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -396,6 +397,9 @@ pub struct Notice {
     /// Tracks whether the user has seen the gpt-5.1-codex-max migration prompt
     #[serde(rename = "hide_gpt-5.1-codex-max_migration_prompt")]
     pub hide_gpt_5_1_codex_max_migration_prompt: Option<bool>,
+    /// Tracks acknowledged model migrations as old->new model slug mappings.
+    #[serde(default)]
+    pub model_migrations: BTreeMap<String, String>,
 }
 
 impl Notice {
@@ -406,7 +410,7 @@ impl Notice {
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct SandboxWorkspaceWrite {
     #[serde(default)]
-    pub writable_roots: Vec<PathBuf>,
+    pub writable_roots: Vec<AbsolutePathBuf>,
     #[serde(default)]
     pub network_access: bool,
     #[serde(default)]
