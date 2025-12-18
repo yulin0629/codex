@@ -393,7 +393,14 @@ impl CodexMessageProcessor {
                 self.handle_list_conversations(request_id, params).await;
             }
             ClientRequest::ModelList { request_id, params } => {
-                self.list_models(request_id, params).await;
+                let outgoing = self.outgoing.clone();
+                let conversation_manager = self.conversation_manager.clone();
+                let config = self.config.clone();
+
+                tokio::spawn(async move {
+                    Self::list_models(outgoing, conversation_manager, config, request_id, params)
+                        .await;
+                });
             }
             ClientRequest::McpServerOauthLogin { request_id, params } => {
                 self.mcp_server_oauth_login(request_id, params).await;
@@ -1373,9 +1380,13 @@ impl CodexMessageProcessor {
                 };
 
                 // Auto-attach a conversation listener when starting a thread.
-                // Use the same behavior as the v1 API with experimental_raw_events=false.
+                // Use the same behavior as the v1 API, with opt-in support for raw item events.
                 if let Err(err) = self
-                    .attach_conversation_listener(conversation_id, false, ApiVersion::V2)
+                    .attach_conversation_listener(
+                        conversation_id,
+                        params.experimental_raw_events,
+                        ApiVersion::V2,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1892,9 +1903,17 @@ impl CodexMessageProcessor {
         Ok((items, next_cursor))
     }
 
-    async fn list_models(&self, request_id: RequestId, params: ModelListParams) {
+    async fn list_models(
+        outgoing: Arc<OutgoingMessageSender>,
+        conversation_manager: Arc<ConversationManager>,
+        config: Arc<Config>,
+        request_id: RequestId,
+        params: ModelListParams,
+    ) {
         let ModelListParams { limit, cursor } = params;
-        let models = supported_models(self.conversation_manager.clone(), &self.config).await;
+        let mut config = (*config).clone();
+        config.features.enable(Feature::RemoteModels);
+        let models = supported_models(conversation_manager, &config).await;
         let total = models.len();
 
         if total == 0 {
@@ -1902,7 +1921,7 @@ impl CodexMessageProcessor {
                 data: Vec::new(),
                 next_cursor: None,
             };
-            self.outgoing.send_response(request_id, response).await;
+            outgoing.send_response(request_id, response).await;
             return;
         }
 
@@ -1917,7 +1936,7 @@ impl CodexMessageProcessor {
                         message: format!("invalid cursor: {cursor}"),
                         data: None,
                     };
-                    self.outgoing.send_error(request_id, error).await;
+                    outgoing.send_error(request_id, error).await;
                     return;
                 }
             },
@@ -1930,7 +1949,7 @@ impl CodexMessageProcessor {
                 message: format!("cursor {start} exceeds total models {total}"),
                 data: None,
             };
-            self.outgoing.send_error(request_id, error).await;
+            outgoing.send_error(request_id, error).await;
             return;
         }
 
@@ -1945,7 +1964,7 @@ impl CodexMessageProcessor {
             data: items,
             next_cursor,
         };
-        self.outgoing.send_response(request_id, response).await;
+        outgoing.send_response(request_id, response).await;
     }
 
     async fn mcp_server_oauth_login(
@@ -2057,6 +2076,7 @@ impl CodexMessageProcessor {
         request_id: RequestId,
         params: ListMcpServerStatusParams,
     ) {
+        let outgoing = Arc::clone(&self.outgoing);
         let config = match self.load_latest_config().await {
             Ok(config) => config,
             Err(error) => {
@@ -2065,6 +2085,17 @@ impl CodexMessageProcessor {
             }
         };
 
+        tokio::spawn(async move {
+            Self::list_mcp_server_status_task(outgoing, request_id, params, config).await;
+        });
+    }
+
+    async fn list_mcp_server_status_task(
+        outgoing: Arc<OutgoingMessageSender>,
+        request_id: RequestId,
+        params: ListMcpServerStatusParams,
+        config: Config,
+    ) {
         let snapshot = collect_mcp_snapshot(&config).await;
 
         let tools_by_server = group_tools_by_server(&snapshot.tools);
@@ -2092,7 +2123,7 @@ impl CodexMessageProcessor {
                         message: format!("invalid cursor: {cursor}"),
                         data: None,
                     };
-                    self.outgoing.send_error(request_id, error).await;
+                    outgoing.send_error(request_id, error).await;
                     return;
                 }
             },
@@ -2105,7 +2136,7 @@ impl CodexMessageProcessor {
                 message: format!("cursor {start} exceeds total MCP servers {total}"),
                 data: None,
             };
-            self.outgoing.send_error(request_id, error).await;
+            outgoing.send_error(request_id, error).await;
             return;
         }
 
@@ -2139,7 +2170,7 @@ impl CodexMessageProcessor {
 
         let response = ListMcpServerStatusResponse { data, next_cursor };
 
-        self.outgoing.send_response(request_id, response).await;
+        outgoing.send_response(request_id, response).await;
     }
 
     async fn handle_resume_conversation(
