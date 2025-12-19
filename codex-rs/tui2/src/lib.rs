@@ -68,7 +68,6 @@ mod resume_picker;
 mod selection_list;
 mod session_log;
 mod shimmer;
-mod skill_error_prompt;
 mod slash_command;
 mod status;
 mod status_indicator_widget;
@@ -319,6 +318,9 @@ pub async fn run_main(
         .with(otel_tracing_layer)
         .with(otel_logger_layer)
         .try_init();
+
+    let terminal_info = codex_core::terminal::terminal_info();
+    tracing::info!(terminal = ?terminal_info, "Detected terminal info");
 
     run_ratatui_app(
         cli,
@@ -573,7 +575,7 @@ async fn load_config_or_exit(
     overrides: ConfigOverrides,
 ) -> Config {
     #[allow(clippy::print_stderr)]
-    match Config::load_with_cli_overrides(cli_kv_overrides, overrides).await {
+    match Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await {
         Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");

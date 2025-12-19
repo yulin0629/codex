@@ -3,7 +3,7 @@ use crate::git_info::resolve_root_git_project_for_trust;
 use crate::skills::model::SkillError;
 use crate::skills::model::SkillLoadOutcome;
 use crate::skills::model::SkillMetadata;
-use crate::skills::public::public_cache_root_dir;
+use crate::skills::system::system_cache_root_dir;
 use codex_protocol::protocol::SkillScope;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
@@ -20,6 +20,14 @@ use tracing::error;
 struct SkillFrontmatter {
     name: String,
     description: String,
+    #[serde(default)]
+    metadata: SkillFrontmatterMetadata,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillFrontmatterMetadata {
+    #[serde(default, rename = "short-description")]
+    short_description: Option<String>,
 }
 
 const SKILLS_FILENAME: &str = "SKILL.md";
@@ -27,6 +35,7 @@ const SKILLS_DIR_NAME: &str = "skills";
 const REPO_ROOT_CONFIG_DIR_NAME: &str = ".codex";
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 1024;
+const MAX_SHORT_DESCRIPTION_LEN: usize = MAX_DESCRIPTION_LEN;
 
 #[derive(Debug)]
 enum SkillParseError {
@@ -92,10 +101,10 @@ pub(crate) fn user_skills_root(codex_home: &Path) -> SkillRoot {
     }
 }
 
-pub(crate) fn public_skills_root(codex_home: &Path) -> SkillRoot {
+pub(crate) fn system_skills_root(codex_home: &Path) -> SkillRoot {
     SkillRoot {
-        path: public_cache_root_dir(codex_home),
-        scope: SkillScope::Public,
+        path: system_cache_root_dir(codex_home),
+        scope: SkillScope::System,
     }
 }
 
@@ -139,9 +148,9 @@ fn skill_roots(config: &Config) -> Vec<SkillRoot> {
     }
 
     // Load order matters: we dedupe by name, keeping the first occurrence.
-    // This makes repo/user skills win over public skills.
+    // This makes repo/user skills win over system skills.
     roots.push(user_skills_root(&config.codex_home));
-    roots.push(public_skills_root(&config.codex_home));
+    roots.push(system_skills_root(&config.codex_home));
 
     roots
 }
@@ -195,7 +204,7 @@ fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut Skil
                         outcome.skills.push(skill);
                     }
                     Err(err) => {
-                        if scope != SkillScope::Public {
+                        if scope != SkillScope::System {
                             outcome.errors.push(SkillError {
                                 path,
                                 message: err.to_string(),
@@ -218,15 +227,29 @@ fn parse_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Ski
 
     let name = sanitize_single_line(&parsed.name);
     let description = sanitize_single_line(&parsed.description);
+    let short_description = parsed
+        .metadata
+        .short_description
+        .as_deref()
+        .map(sanitize_single_line)
+        .filter(|value| !value.is_empty());
 
     validate_field(&name, MAX_NAME_LEN, "name")?;
     validate_field(&description, MAX_DESCRIPTION_LEN, "description")?;
+    if let Some(short_description) = short_description.as_deref() {
+        validate_field(
+            short_description,
+            MAX_SHORT_DESCRIPTION_LEN,
+            "metadata.short-description",
+        )?;
+    }
 
     let resolved_path = normalize_path(path).unwrap_or_else(|_| path.to_path_buf());
 
     Ok(SkillMetadata {
         name,
         description,
+        short_description,
         path: resolved_path,
         scope,
     })
@@ -303,6 +326,20 @@ mod tests {
         write_skill_at(&codex_home.path().join("skills"), dir, name, description)
     }
 
+    fn write_system_skill(
+        codex_home: &TempDir,
+        dir: &str,
+        name: &str,
+        description: &str,
+    ) -> PathBuf {
+        write_skill_at(
+            &codex_home.path().join("skills/.system"),
+            dir,
+            name,
+            description,
+        )
+    }
+
     fn write_skill_at(root: &Path, dir: &str, name: &str, description: &str) -> PathBuf {
         let skill_dir = root.join(dir);
         fs::create_dir_all(&skill_dir).unwrap();
@@ -331,10 +368,57 @@ mod tests {
         let skill = &outcome.skills[0];
         assert_eq!(skill.name, "demo-skill");
         assert_eq!(skill.description, "does things carefully");
+        assert_eq!(skill.short_description, None);
         let path_str = skill.path.to_string_lossy().replace('\\', "/");
         assert!(
             path_str.ends_with("skills/demo/SKILL.md"),
             "unexpected path {path_str}"
+        );
+    }
+
+    #[test]
+    fn loads_short_description_from_metadata() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let contents = "---\nname: demo-skill\ndescription: long description\nmetadata:\n  short-description: short summary\n---\n\n# Body\n";
+        fs::write(skill_dir.join(SKILLS_FILENAME), contents).unwrap();
+
+        let cfg = make_config(&codex_home);
+        let outcome = load_skills(&cfg);
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(
+            outcome.skills[0].short_description,
+            Some("short summary".to_string())
+        );
+    }
+
+    #[test]
+    fn enforces_short_description_length_limits() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let too_long = "x".repeat(MAX_SHORT_DESCRIPTION_LEN + 1);
+        let contents = format!(
+            "---\nname: demo-skill\ndescription: long description\nmetadata:\n  short-description: {too_long}\n---\n\n# Body\n"
+        );
+        fs::write(skill_dir.join(SKILLS_FILENAME), contents).unwrap();
+
+        let cfg = make_config(&codex_home);
+        let outcome = load_skills(&cfg);
+        assert_eq!(outcome.skills.len(), 0);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0]
+                .message
+                .contains("invalid metadata.short-description"),
+            "expected length error, got: {:?}",
+            outcome.errors
         );
     }
 
@@ -540,6 +624,25 @@ mod tests {
     }
 
     #[test]
+    fn loads_system_skills_with_lowest_priority() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+
+        write_system_skill(&codex_home, "system", "dupe-skill", "from system");
+        write_skill(&codex_home, "user", "dupe-skill", "from user");
+
+        let cfg = make_config(&codex_home);
+        let outcome = load_skills(&cfg);
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].description, "from user");
+        assert_eq!(outcome.skills[0].scope, SkillScope::User);
+    }
+
+    #[test]
     fn repo_skills_search_does_not_escape_repo_root() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let outer_dir = tempfile::tempdir().expect("tempdir");
@@ -643,16 +746,11 @@ mod tests {
     }
 
     #[test]
-    fn loads_skills_from_public_cache_when_present() {
+    fn loads_skills_from_system_cache_when_present() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let work_dir = tempfile::tempdir().expect("tempdir");
 
-        write_skill_at(
-            &codex_home.path().join("skills").join(".public"),
-            "public",
-            "public-skill",
-            "from public",
-        );
+        write_system_skill(&codex_home, "system", "system-skill", "from system");
 
         let mut cfg = make_config(&codex_home);
         cfg.cwd = work_dir.path().to_path_buf();
@@ -664,22 +762,17 @@ mod tests {
             outcome.errors
         );
         assert_eq!(outcome.skills.len(), 1);
-        assert_eq!(outcome.skills[0].name, "public-skill");
-        assert_eq!(outcome.skills[0].scope, SkillScope::Public);
+        assert_eq!(outcome.skills[0].name, "system-skill");
+        assert_eq!(outcome.skills[0].scope, SkillScope::System);
     }
 
     #[test]
-    fn deduplicates_by_name_preferring_user_over_public() {
+    fn deduplicates_by_name_preferring_user_over_system() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let work_dir = tempfile::tempdir().expect("tempdir");
 
         write_skill(&codex_home, "user", "dupe-skill", "from user");
-        write_skill_at(
-            &codex_home.path().join("skills").join(".public"),
-            "public",
-            "dupe-skill",
-            "from public",
-        );
+        write_system_skill(&codex_home, "system", "dupe-skill", "from system");
 
         let mut cfg = make_config(&codex_home);
         cfg.cwd = work_dir.path().to_path_buf();
@@ -696,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn deduplicates_by_name_preferring_repo_over_public() {
+    fn deduplicates_by_name_preferring_repo_over_system() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let repo_dir = tempfile::tempdir().expect("tempdir");
 
@@ -716,12 +809,7 @@ mod tests {
             "dupe-skill",
             "from repo",
         );
-        write_skill_at(
-            &codex_home.path().join("skills").join(".public"),
-            "public",
-            "dupe-skill",
-            "from public",
-        );
+        write_system_skill(&codex_home, "system", "dupe-skill", "from system");
 
         let mut cfg = make_config(&codex_home);
         cfg.cwd = repo_dir.path().to_path_buf();

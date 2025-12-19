@@ -1690,13 +1690,16 @@ pub struct ListSkillsResponseEvent {
 pub enum SkillScope {
     User,
     Repo,
-    Public,
+    System,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
+    #[ts(optional)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
     pub path: PathBuf,
     pub scope: SkillScope,
 }

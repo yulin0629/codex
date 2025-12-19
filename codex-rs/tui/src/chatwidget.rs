@@ -977,10 +977,7 @@ impl ChatWidget {
 
     fn on_web_search_end(&mut self, ev: WebSearchEndEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_web_search_call(format!(
-            "Searched: {}",
-            ev.query
-        )));
+        self.add_to_history(history_cell::new_web_search_call(ev.query));
     }
 
     fn on_get_history_entry_response(
@@ -1703,6 +1700,9 @@ impl ChatWidget {
             SlashCommand::Status => {
                 self.add_status_output();
             }
+            SlashCommand::Ps => {
+                self.add_ps_output();
+            }
             SlashCommand::Mcp => {
                 self.add_mcp_output();
             }
@@ -2157,6 +2157,16 @@ impl ChatWidget {
             self.model_family.get_model_slug(),
         ));
     }
+
+    pub(crate) fn add_ps_output(&mut self) {
+        let sessions = self
+            .unified_exec_sessions
+            .iter()
+            .map(|session| session.command_display.clone())
+            .collect();
+        self.add_to_history(history_cell::new_unified_exec_sessions_output(sessions));
+    }
+
     fn stop_rate_limit_poller(&mut self) {
         if let Some(handle) = self.rate_limit_poller.take() {
             handle.abort();
@@ -2191,7 +2201,7 @@ impl ChatWidget {
     }
 
     fn lower_cost_preset(&self) -> Option<ModelPreset> {
-        let models = self.models_manager.try_list_models().ok()?;
+        let models = self.models_manager.try_list_models(&self.config).ok()?;
         models
             .iter()
             .find(|preset| preset.model == NUDGE_MODEL_SLUG)
@@ -2300,7 +2310,7 @@ impl ChatWidget {
         let current_model = self.model_family.get_model_slug().to_string();
         let presets: Vec<ModelPreset> =
             // todo(aibrahim): make this async function
-            match self.models_manager.try_list_models() {
+            match self.models_manager.try_list_models(&self.config) {
                 Ok(models) => models,
                 Err(_) => {
                     self.add_info_message(
@@ -2730,10 +2740,11 @@ impl ChatWidget {
         let features: Vec<BetaFeatureItem> = FEATURES
             .iter()
             .filter_map(|spec| {
+                let name = spec.stage.beta_menu_name()?;
                 let description = spec.stage.beta_menu_description()?;
                 Some(BetaFeatureItem {
                     feature: spec.id,
-                    name: feature_label_from_key(spec.key),
+                    name: name.to_string(),
                     description: description.to_string(),
                     enabled: self.config.features.enabled(spec.id),
                 })
@@ -3427,23 +3438,6 @@ impl ChatWidget {
     }
 }
 
-fn feature_label_from_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    let mut capitalize = true;
-    for ch in key.chars() {
-        if ch == '_' || ch == '-' {
-            out.push(' ');
-            capitalize = true;
-        } else if capitalize {
-            out.push(ch.to_ascii_uppercase());
-            capitalize = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
@@ -3640,6 +3634,7 @@ fn skills_for_cwd(cwd: &Path, skills_entries: &[SkillsListEntry]) -> Vec<SkillMe
                 .map(|skill| SkillMetadata {
                     name: skill.name.clone(),
                     description: skill.description.clone(),
+                    short_description: skill.short_description.clone(),
                     path: skill.path.clone(),
                     scope: skill.scope,
                 })

@@ -891,10 +891,7 @@ impl ChatWidget {
 
     fn on_web_search_end(&mut self, ev: WebSearchEndEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_web_search_call(format!(
-            "Searched: {}",
-            ev.query
-        )));
+        self.add_to_history(history_cell::new_web_search_call(ev.query));
     }
 
     fn on_get_history_entry_response(
@@ -2100,7 +2097,7 @@ impl ChatWidget {
     }
 
     fn lower_cost_preset(&self) -> Option<ModelPreset> {
-        let models = self.models_manager.try_list_models().ok()?;
+        let models = self.models_manager.try_list_models(&self.config).ok()?;
         models
             .iter()
             .find(|preset| preset.model == NUDGE_MODEL_SLUG)
@@ -2209,7 +2206,7 @@ impl ChatWidget {
         let current_model = self.model_family.get_model_slug().to_string();
         let presets: Vec<ModelPreset> =
             // todo(aibrahim): make this async function
-            match self.models_manager.try_list_models() {
+            match self.models_manager.try_list_models(&self.config) {
                 Ok(models) => models,
                 Err(_) => {
                     self.add_info_message(
@@ -3542,6 +3539,7 @@ fn skills_for_cwd(cwd: &Path, skills_entries: &[SkillsListEntry]) -> Vec<SkillMe
                 .map(|skill| SkillMetadata {
                     name: skill.name.clone(),
                     description: skill.description.clone(),
+                    short_description: skill.short_description.clone(),
                     path: skill.path.clone(),
                     scope: skill.scope,
                 })
