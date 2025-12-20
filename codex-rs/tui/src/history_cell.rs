@@ -13,6 +13,7 @@ use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
 use crate::render::renderable::Renderable;
+use crate::shimmer::shimmer_spans;
 use crate::style::user_message_style;
 use crate::text_formatting::format_and_truncate_tool_result;
 use crate::text_formatting::truncate_text;
@@ -441,6 +442,79 @@ pub(crate) fn new_unified_exec_interaction(
     stdin: String,
 ) -> UnifiedExecInteractionCell {
     UnifiedExecInteractionCell::new(command_display, stdin)
+}
+
+#[derive(Debug)]
+// Live-only wait cell that shimmers while we poll; flushes into a static entry later.
+pub(crate) struct UnifiedExecWaitCell {
+    command_display: Option<String>,
+    animations_enabled: bool,
+}
+
+impl UnifiedExecWaitCell {
+    pub(crate) fn new(command_display: Option<String>, animations_enabled: bool) -> Self {
+        Self {
+            command_display: command_display.filter(|display| !display.is_empty()),
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn matches(&self, command_display: Option<&str>) -> bool {
+        let command_display = command_display.filter(|display| !display.is_empty());
+        match (self.command_display.as_deref(), command_display) {
+            (Some(current), Some(incoming)) => current == incoming,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn update_command_display(&mut self, command_display: Option<String>) {
+        if self.command_display.is_none() {
+            self.command_display = command_display.filter(|display| !display.is_empty());
+        }
+    }
+
+    pub(crate) fn command_display(&self) -> Option<String> {
+        self.command_display.clone()
+    }
+}
+
+impl HistoryCell for UnifiedExecWaitCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let wrap_width = width as usize;
+
+        let mut header_spans = vec!["• ".dim()];
+        if self.animations_enabled {
+            header_spans.extend(shimmer_spans("Waiting for background terminal"));
+        } else {
+            header_spans.push("Waiting for background terminal".bold());
+        }
+        if let Some(command) = &self.command_display
+            && !command.is_empty()
+        {
+            header_spans.push(" · ".dim());
+            header_spans.push(command.clone().dim());
+        }
+        let header = Line::from(header_spans);
+
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let header_wrapped = word_wrap_line(&header, RtOptions::new(wrap_width));
+        push_owned_lines(&header_wrapped, &mut out);
+        out
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width).len() as u16
+    }
+}
+
+pub(crate) fn new_unified_exec_wait_live(
+    command_display: Option<String>,
+    animations_enabled: bool,
+) -> UnifiedExecWaitCell {
+    UnifiedExecWaitCell::new(command_display, animations_enabled)
 }
 
 #[derive(Debug)]
@@ -1682,8 +1756,7 @@ mod tests {
     use crate::exec_cell::ExecCall;
     use crate::exec_cell::ExecCell;
     use codex_core::config::Config;
-    use codex_core::config::ConfigOverrides;
-    use codex_core::config::ConfigToml;
+    use codex_core::config::ConfigBuilder;
     use codex_core::config::types::McpServerConfig;
     use codex_core::config::types::McpServerTransportConfig;
     use codex_core::openai_models::models_manager::ModelsManager;
@@ -1700,14 +1773,13 @@ mod tests {
     use mcp_types::TextContent;
     use mcp_types::Tool;
     use mcp_types::ToolInputSchema;
-
-    fn test_config() -> Config {
-        Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            std::env::temp_dir(),
-        )
-        .expect("config")
+    async fn test_config() -> Config {
+        let codex_home = std::env::temp_dir();
+        ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .build()
+            .await
+            .expect("config")
     }
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -1752,6 +1824,13 @@ mod tests {
     }
 
     #[test]
+    fn unified_exec_wait_cell_renders_wait() {
+        let cell = new_unified_exec_wait_live(None, false);
+        let lines = render_transcript(&cell);
+        assert_eq!(lines, vec!["• Waiting for background terminal"],);
+    }
+
+    #[test]
     fn ps_output_empty_snapshot() {
         let cell = new_unified_exec_sessions_output(Vec::new());
         let rendered = render_lines(&cell.display_lines(60)).join("\n");
@@ -1785,9 +1864,9 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    #[test]
-    fn mcp_tools_output_masks_sensitive_values() {
-        let mut config = test_config();
+    #[tokio::test]
+    async fn mcp_tools_output_masks_sensitive_values() {
+        let mut config = test_config().await;
         let mut env = HashMap::new();
         env.insert("TOKEN".to_string(), "secret".to_string());
         let stdio_config = McpServerConfig {
@@ -2618,9 +2697,9 @@ mod tests {
         assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
     }
 
-    #[test]
-    fn reasoning_summary_block_respects_config_overrides() {
-        let mut config = test_config();
+    #[tokio::test]
+    async fn reasoning_summary_block_respects_config_overrides() {
+        let mut config = test_config().await;
         config.model = Some("gpt-3.5-turbo".to_string());
         config.model_supports_reasoning_summaries = Some(true);
         config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
