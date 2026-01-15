@@ -33,7 +33,8 @@
 //!   burst detection for actual paste streams.
 //!
 //! The burst detector can also be disabled (`disable_paste_burst`), which bypasses the state
-//! machine and treats the key stream as normal typing.
+//! machine and treats the key stream as normal typing. When toggling from enabled → disabled, the
+//! composer flushes/clears any in-flight burst state so it cannot leak into subsequent input.
 //!
 //! For the detailed burst state machine, see `codex-rs/tui/src/bottom_pane/paste_burst.rs`.
 //! For a narrative overview of the combined state machine, see `docs/tui-chat-composer.md`.
@@ -56,7 +57,8 @@
 //! edits and renders a placeholder prompt instead of the editable textarea. This is part of the
 //! overall state machine, since it affects which transitions are even possible from a given UI
 //! state.
-
+use crate::key_hint;
+use crate::key_hint::KeyBinding;
 use crate::key_hint::has_ctrl_or_alt;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -167,7 +169,8 @@ pub(crate) struct ChatComposer {
     active_popup: ActivePopup,
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
-    ctrl_c_quit_hint: bool,
+    quit_shortcut_expires_at: Option<Instant>,
+    quit_shortcut_key: KeyBinding,
     esc_backtrack_hint: bool,
     use_shift_enter_hint: bool,
     dismissed_file_popup_token: Option<String>,
@@ -192,6 +195,7 @@ pub(crate) struct ChatComposer {
     context_window_used_tokens: Option<i64>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
+    /// When enabled, `Enter` submits immediately and `Tab` requests queuing behavior.
     steer_enabled: bool,
 }
 
@@ -221,7 +225,8 @@ impl ChatComposer {
             active_popup: ActivePopup::None,
             app_event_tx,
             history: ChatComposerHistory::new(),
-            ctrl_c_quit_hint: false,
+            quit_shortcut_expires_at: None,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             esc_backtrack_hint: false,
             use_shift_enter_hint,
             dismissed_file_popup_token: None,
@@ -254,6 +259,12 @@ impl ChatComposer {
         self.skills = skills;
     }
 
+    /// Enables or disables "Steer" behavior for submission keys.
+    ///
+    /// When steer is enabled, `Enter` produces [`InputResult::Submitted`] (send immediately) and
+    /// `Tab` produces [`InputResult::Queued`] (eligible to queue if a task is running).
+    /// When steer is disabled, `Enter` produces [`InputResult::Queued`], preserving the default
+    /// "queue while a task is running" behavior.
     pub fn set_steer_enabled(&mut self, enabled: bool) {
         self.steer_enabled = enabled;
     }
@@ -379,16 +390,27 @@ impl ChatComposer {
     /// `disable_paste_burst` is an escape hatch for terminals/platforms where the burst heuristic
     /// is unwanted or has already been handled elsewhere.
     ///
-    /// When enabling the flag we clear the burst classification window so subsequent input cannot
-    /// be incorrectly grouped into a previous burst.
+    /// When transitioning from enabled → disabled, we "defuse" any in-flight burst state so it
+    /// cannot affect subsequent normal typing:
     ///
-    /// This does not flush any in-progress buffer; callers should avoid toggling this mid-burst
-    /// (or should flush first).
+    /// - First, flush any held/buffered text immediately via
+    ///   [`PasteBurst::flush_before_modified_input`], and feed it through `handle_paste(String)`.
+    ///   This preserves user input and routes it through the same integration path as explicit
+    ///   pastes (large-paste placeholders, image-path detection, and popup sync).
+    /// - Then clear the burst timing and Enter-suppression window via
+    ///   [`PasteBurst::clear_after_explicit_paste`].
+    ///
+    /// We intentionally do not use `clear_window_after_non_char()` here: it clears timing state
+    /// without emitting any buffered text, which can leave a non-empty buffer unable to flush
+    /// later (because `flush_if_due()` relies on `last_plain_char_time` to time out).
     pub(crate) fn set_disable_paste_burst(&mut self, disabled: bool) {
         let was_disabled = self.disable_paste_burst;
         self.disable_paste_burst = disabled;
         if disabled && !was_disabled {
-            self.paste_burst.clear_window_after_non_char();
+            if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+                self.handle_paste(pasted);
+            }
+            self.paste_burst.clear_after_explicit_paste();
         }
     }
 
@@ -566,14 +588,35 @@ impl ChatComposer {
         }
     }
 
-    pub fn set_ctrl_c_quit_hint(&mut self, show: bool, has_focus: bool) {
-        self.ctrl_c_quit_hint = show;
-        if show {
-            self.footer_mode = FooterMode::CtrlCReminder;
-        } else {
-            self.footer_mode = reset_mode_after_activity(self.footer_mode);
-        }
+    /// Show the transient "press again to quit" hint for `key`.
+    ///
+    /// The owner (`BottomPane`/`ChatWidget`) is responsible for scheduling a
+    /// redraw after [`super::QUIT_SHORTCUT_TIMEOUT`] so the hint can disappear
+    /// even when the UI is otherwise idle.
+    pub fn show_quit_shortcut_hint(&mut self, key: KeyBinding, has_focus: bool) {
+        self.quit_shortcut_expires_at = Instant::now()
+            .checked_add(super::QUIT_SHORTCUT_TIMEOUT)
+            .or_else(|| Some(Instant::now()));
+        self.quit_shortcut_key = key;
+        self.footer_mode = FooterMode::QuitShortcutReminder;
         self.set_has_focus(has_focus);
+    }
+
+    /// Clear the "press again to quit" hint immediately.
+    pub fn clear_quit_shortcut_hint(&mut self, has_focus: bool) {
+        self.quit_shortcut_expires_at = None;
+        self.footer_mode = reset_mode_after_activity(self.footer_mode);
+        self.set_has_focus(has_focus);
+    }
+
+    /// Whether the quit shortcut hint should currently be shown.
+    ///
+    /// This is time-based rather than event-based: it may become false without
+    /// any additional user input, so the UI schedules a redraw when the hint
+    /// expires.
+    pub(crate) fn quit_shortcut_hint_visible(&self) -> bool {
+        self.quit_shortcut_expires_at
+            .is_some_and(|expires_at| Instant::now() < expires_at)
     }
 
     fn next_large_paste_placeholder(&mut self, char_count: usize) -> String {
@@ -799,6 +842,15 @@ impl ChatComposer {
     /// the cursor to a UTF-8 char boundary before slicing `textarea.text()`.
     #[inline]
     fn handle_non_ascii_char(&mut self, input: KeyEvent) -> (InputResult, bool) {
+        if self.disable_paste_burst {
+            // When burst detection is disabled, treat IME/non-ASCII input as normal typing.
+            // In particular, do not retro-capture or buffer already-inserted prefix text.
+            self.textarea.input(input);
+            let text_after = self.textarea.text();
+            self.pending_pastes
+                .retain(|(placeholder, _)| text_after.contains(placeholder));
+            return (InputResult::None, true);
+        }
         if let KeyEvent {
             code: KeyCode::Char(ch),
             ..
@@ -1372,7 +1424,7 @@ impl ChatComposer {
                 .next()
                 .unwrap_or("")
                 .starts_with('/');
-        if self.paste_burst.is_active() && !in_slash_context {
+        if !self.disable_paste_burst && self.paste_burst.is_active() && !in_slash_context {
             let now = Instant::now();
             if self.paste_burst.append_newline_if_active(now) {
                 return (InputResult::None, true);
@@ -1381,10 +1433,11 @@ impl ChatComposer {
 
         // During a paste-like burst, treat Enter/Ctrl+Shift+Q as a newline instead of submit.
         let now = Instant::now();
-        if self
-            .paste_burst
-            .newline_should_insert_instead_of_submit(now)
-            && !in_slash_context
+        if !in_slash_context
+            && !self.disable_paste_burst
+            && self
+                .paste_burst
+                .newline_should_insert_instead_of_submit(now)
         {
             self.textarea.insert_str("\n");
             self.paste_burst.extend_window(now);
@@ -1475,10 +1528,7 @@ impl ChatComposer {
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
                 kind: KeyEventKind::Press,
                 ..
-            } if self.is_empty() => {
-                self.app_event_tx.send(AppEvent::ExitRequest);
-                (InputResult::None, true)
-            }
+            } if self.is_empty() => (InputResult::None, false),
             // -------------------------------------------------------------
             // History navigation (Up / Down) – only when the composer is not
             // empty or when the cursor is at the correct position, to avoid
@@ -1580,6 +1630,7 @@ impl ChatComposer {
 
         // If we're capturing a burst and receive Enter, accumulate it instead of inserting.
         if matches!(input.code, KeyCode::Enter)
+            && !self.disable_paste_burst
             && self.paste_burst.is_active()
             && self.paste_burst.append_newline_if_active(now)
         {
@@ -1598,7 +1649,7 @@ impl ChatComposer {
         } = input
         {
             let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
-            if !has_ctrl_or_alt {
+            if !has_ctrl_or_alt && !self.disable_paste_burst {
                 // Non-ASCII characters (e.g., from IMEs) can arrive in quick bursts, so avoid
                 // holding the first char while still allowing burst detection for paste input.
                 if !ch.is_ascii() {
@@ -1644,6 +1695,17 @@ impl ChatComposer {
             }
         }
 
+        // Flush any buffered burst before applying a non-char input (arrow keys, etc).
+        //
+        // `clear_window_after_non_char()` clears `last_plain_char_time`. If we cleared that while
+        // `PasteBurst.buffer` is non-empty, `flush_if_due()` would no longer have a timestamp to
+        // time out against, and the buffered paste could remain stuck until another plain char
+        // arrives.
+        if !matches!(input.code, KeyCode::Char(_) | KeyCode::Enter)
+            && let Some(pasted) = self.paste_burst.flush_before_modified_input()
+        {
+            self.handle_paste(pasted);
+        }
         // Backspace at the start of an image placeholder should delete that placeholder (rather
         // than deleting content before it). Do this without scanning the full text by consulting
         // the textarea's element list.
@@ -1767,7 +1829,7 @@ impl ChatComposer {
             return false;
         }
 
-        let next = toggle_shortcut_mode(self.footer_mode, self.ctrl_c_quit_hint);
+        let next = toggle_shortcut_mode(self.footer_mode, self.quit_shortcut_hint_visible());
         let changed = next != self.footer_mode;
         self.footer_mode = next;
         changed
@@ -1779,6 +1841,7 @@ impl ChatComposer {
             esc_backtrack_hint: self.esc_backtrack_hint,
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
+            quit_shortcut_key: self.quit_shortcut_key,
             steer_enabled: self.steer_enabled,
             context_window_percent: self.context_window_percent,
             context_window_used_tokens: self.context_window_used_tokens,
@@ -1789,8 +1852,13 @@ impl ChatComposer {
         match self.footer_mode {
             FooterMode::EscHint => FooterMode::EscHint,
             FooterMode::ShortcutOverlay => FooterMode::ShortcutOverlay,
-            FooterMode::CtrlCReminder => FooterMode::CtrlCReminder,
-            FooterMode::ShortcutSummary if self.ctrl_c_quit_hint => FooterMode::CtrlCReminder,
+            FooterMode::QuitShortcutReminder if self.quit_shortcut_hint_visible() => {
+                FooterMode::QuitShortcutReminder
+            }
+            FooterMode::QuitShortcutReminder => FooterMode::ShortcutSummary,
+            FooterMode::ShortcutSummary if self.quit_shortcut_hint_visible() => {
+                FooterMode::QuitShortcutReminder
+            }
             FooterMode::ShortcutSummary if !self.is_empty() => FooterMode::ContextOnly,
             other => other,
         }
@@ -2331,16 +2399,16 @@ mod tests {
         });
 
         snapshot_composer_state("footer_mode_ctrl_c_quit", true, |composer| {
-            composer.set_ctrl_c_quit_hint(true, true);
+            composer.show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')), true);
         });
 
         snapshot_composer_state("footer_mode_ctrl_c_interrupt", true, |composer| {
             composer.set_task_running(true);
-            composer.set_ctrl_c_quit_hint(true, true);
+            composer.show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')), true);
         });
 
         snapshot_composer_state("footer_mode_ctrl_c_then_esc_hint", true, |composer| {
-            composer.set_ctrl_c_quit_hint(true, true);
+            composer.show_quit_shortcut_hint(key_hint::ctrl(KeyCode::Char('c')), true);
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         });
 
@@ -2919,6 +2987,104 @@ mod tests {
 
         let _ = flush_after_paste_burst(&mut composer);
         assert_eq!(composer.textarea.text(), "hi\nthere");
+    }
+
+    /// Behavior: even if Enter suppression would normally be active for a burst, Enter should
+    /// still dispatch a built-in slash command when the first line begins with `/`.
+    #[test]
+    fn slash_context_enter_ignores_paste_burst_enter_suppression() {
+        use crate::slash_command::SlashCommand;
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.textarea.set_text("/diff");
+        composer.textarea.set_cursor("/diff".len());
+        composer
+            .paste_burst
+            .begin_with_retro_grabbed(String::new(), Instant::now());
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Command(SlashCommand::Diff)));
+    }
+
+    /// Behavior: if a burst is buffering text and the user presses a non-char key, flush the
+    /// buffered burst *before* applying that key so the buffer cannot get stuck.
+    #[test]
+    fn non_char_key_flushes_active_burst_before_input() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        // Force an active burst so we can deterministically buffer characters without relying on
+        // timing.
+        composer
+            .paste_burst
+            .begin_with_retro_grabbed(String::new(), Instant::now());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(composer.textarea.text().is_empty());
+        assert!(composer.is_in_paste_burst());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(composer.textarea.text(), "hi");
+        assert_eq!(composer.textarea.cursor(), 1);
+        assert!(!composer.is_in_paste_burst());
+    }
+
+    /// Behavior: enabling `disable_paste_burst` flushes any held first character (flicker
+    /// suppression) and then inserts subsequent chars immediately without creating burst state.
+    #[test]
+    fn disable_paste_burst_flushes_pending_first_char_and_inserts_immediately() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        // First ASCII char is normally held briefly. Flip the config mid-stream and ensure the
+        // held char is not dropped.
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(composer.is_in_paste_burst());
+        assert!(composer.textarea.text().is_empty());
+
+        composer.set_disable_paste_burst(true);
+        assert_eq!(composer.textarea.text(), "a");
+        assert!(!composer.is_in_paste_burst());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(composer.textarea.text(), "ab");
+        assert!(!composer.is_in_paste_burst());
     }
 
     /// Behavior: a small explicit paste inserts text directly (no placeholder), and the submitted
