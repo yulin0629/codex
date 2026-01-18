@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
+use crate::config_types::CollaborationMode;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::custom_prompts::CustomPrompt;
 use crate::items::TurnItem;
@@ -115,6 +116,11 @@ pub enum Op {
         summary: ReasoningSummaryConfig,
         // The JSON schema to use for the final assistant message
         final_output_json_schema: Option<Value>,
+
+        /// EXPERIMENTAL - set a pre-set collaboration mode.
+        /// Takes precedence over model, effort, and developer instructions if set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collaboration_mode: Option<CollaborationMode>,
     },
 
     /// Override parts of the persistent turn context for subsequent turns.
@@ -150,6 +156,11 @@ pub enum Op {
         /// Updated reasoning summary preference (honored only for reasoning-capable models).
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<ReasoningSummaryConfig>,
+
+        /// EXPERIMENTAL - set a pre-set collaboration mode.
+        /// Takes precedence over model, effort, and developer instructions if set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collaboration_mode: Option<CollaborationMode>,
     },
 
     /// Approve a command execution
@@ -1481,7 +1492,6 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub originator: String,
     pub cli_version: String,
-    pub instructions: Option<String>,
     #[serde(default)]
     pub source: SessionSource,
     pub model_provider: Option<String>,
@@ -1496,7 +1506,6 @@ impl Default for SessionMeta {
             cwd: PathBuf::new(),
             originator: String::new(),
             cli_version: String::new(),
-            instructions: None,
             source: SessionSource::default(),
             model_provider: None,
         }
