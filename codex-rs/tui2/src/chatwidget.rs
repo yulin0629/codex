@@ -33,6 +33,7 @@ use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
+use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::local_git_branches;
@@ -87,6 +88,7 @@ use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_core::skills::model::SkillInterface;
 use codex_core::skills::model::SkillMetadata;
+use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
@@ -121,10 +123,12 @@ use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event::WindowsSandboxFallbackReason;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::BetaFeatureItem;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
+use crate::bottom_pane::ExperimentalFeaturesView;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
@@ -159,6 +163,7 @@ use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
+use crate::ui_consts::DEFAULT_MODEL_DISPLAY_NAME;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod agent;
@@ -210,7 +215,6 @@ impl UnifiedExecWaitState {
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
-const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 
 #[derive(Default)]
 struct RateLimitWarningState {
@@ -311,6 +315,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) model: Option<String>,
+    pub(crate) otel_manager: OtelManager,
 }
 
 #[derive(Default)]
@@ -357,6 +362,7 @@ pub(crate) struct ChatWidget {
     stored_collaboration_mode: CollaborationMode,
     auth_manager: Arc<AuthManager>,
     models_manager: Arc<ModelsManager>,
+    otel_manager: OtelManager,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
@@ -427,6 +433,11 @@ pub(crate) struct ChatWidget {
     // This gates rendering of the "Worked for …" separator so purely conversational turns don't
     // show an empty divider. It is reset when the separator is emitted.
     had_work_activity: bool,
+    // Status-indicator elapsed seconds captured at the last emitted final-message separator.
+    //
+    // This lets the separator show per-chunk work time (since the previous separator) rather than
+    // the total task-running time reported by the status indicator.
+    last_separator_elapsed_secs: Option<u64>,
 
     last_rendered_width: std::cell::Cell<Option<usize>>,
     // Feedback sink for /feedback
@@ -647,6 +658,8 @@ impl ChatWidget {
             &model_for_header,
             event,
             self.show_welcome_banner,
+            self.collaboration_modes_enabled(),
+            self.stored_collaboration_mode.clone(),
         );
         self.apply_session_info_cell(session_info_cell);
 
@@ -1325,7 +1338,8 @@ impl ChatWidget {
                 let elapsed_seconds = self
                     .bottom_pane
                     .status_widget()
-                    .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds);
+                    .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
+                    .map(|current| self.worked_elapsed_from(current));
                 self.add_to_history(history_cell::FinalMessageSeparator::new(elapsed_seconds));
                 self.needs_final_message_separator = false;
                 self.had_work_activity = false;
@@ -1346,6 +1360,17 @@ impl ChatWidget {
         if needs_redraw {
             self.request_redraw();
         }
+    }
+
+    fn worked_elapsed_from(&mut self, current_elapsed: u64) -> u64 {
+        let baseline = match self.last_separator_elapsed_secs {
+            Some(last) if current_elapsed < last => 0,
+            Some(last) => last,
+            None => 0,
+        };
+        let elapsed = current_elapsed.saturating_sub(baseline);
+        self.last_separator_elapsed_secs = Some(current_elapsed);
+        elapsed
     }
 
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
@@ -1599,6 +1624,7 @@ impl ChatWidget {
             feedback,
             is_first_run,
             model,
+            otel_manager,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
@@ -1607,15 +1633,7 @@ impl ChatWidget {
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager);
 
-        let model_for_header = model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL_DISPLAY_NAME.to_string());
-        let active_cell = if model.is_none() {
-            Some(Self::placeholder_session_header_cell(&config))
-        } else {
-            None
-        };
-
+        let model_for_header = model.unwrap_or_else(|| DEFAULT_MODEL_DISPLAY_NAME.to_string());
         let stored_collaboration_mode = if config.features.enabled(Feature::CollaborationModes) {
             collaboration_modes::default_mode(models_manager.as_ref()).unwrap_or_else(|| {
                 CollaborationMode::Custom(Settings {
@@ -1631,6 +1649,11 @@ impl ChatWidget {
                 developer_instructions: None,
             })
         };
+        let active_cell = Some(Self::placeholder_session_header_cell(
+            &config,
+            config.features.enabled(Feature::CollaborationModes),
+            stored_collaboration_mode.clone(),
+        ));
 
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -1652,6 +1675,7 @@ impl ChatWidget {
             stored_collaboration_mode,
             auth_manager,
             models_manager,
+            otel_manager,
             session_header: SessionHeader::new(model_for_header),
             initial_user_message,
             token_info: None,
@@ -1684,6 +1708,7 @@ impl ChatWidget {
             pre_review_token_info: None,
             needs_final_message_separator: false,
             had_work_activity: false,
+            last_separator_elapsed_secs: None,
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
@@ -1716,6 +1741,7 @@ impl ChatWidget {
             models_manager,
             feedback,
             model,
+            otel_manager,
             ..
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
@@ -1764,6 +1790,7 @@ impl ChatWidget {
             stored_collaboration_mode,
             auth_manager,
             models_manager,
+            otel_manager,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
@@ -1796,6 +1823,7 @@ impl ChatWidget {
             pre_review_token_info: None,
             needs_final_message_separator: false,
             had_work_activity: false,
+            last_separator_elapsed_secs: None,
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
@@ -2051,13 +2079,22 @@ impl ChatWidget {
                         return;
                     }
 
+                    self.otel_manager.counter(
+                        "codex.windows_sandbox.setup_elevated_sandbox_command",
+                        1,
+                        &[],
+                    );
                     self.app_event_tx
                         .send(AppEvent::BeginWindowsSandboxElevatedSetup { preset });
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
+                    let _ = &self.otel_manager;
                     // Not supported; on non-Windows this command should never be reachable.
                 };
+            }
+            SlashCommand::Experimental => {
+                self.open_experimental_popup();
             }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.request_quit_without_confirmation();
@@ -3338,6 +3375,25 @@ impl ChatWidget {
         });
     }
 
+    pub(crate) fn open_experimental_popup(&mut self) {
+        let features: Vec<BetaFeatureItem> = FEATURES
+            .iter()
+            .filter_map(|spec| {
+                let name = spec.stage.beta_menu_name()?;
+                let description = spec.stage.beta_menu_description()?;
+                Some(BetaFeatureItem {
+                    feature: spec.id,
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    enabled: self.config.features.enabled(spec.id),
+                })
+            })
+            .collect();
+
+        let view = ExperimentalFeaturesView::new(features, self.app_event_tx.clone());
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     fn approval_preset_actions(
         approval: AskForApproval,
         sandbox: SandboxPolicy,
@@ -3645,22 +3701,8 @@ impl ChatWidget {
             .is_some_and(|preset| {
                 Self::preset_matches_current(current_approval, current_sandbox, preset)
             });
-        let stay_actions = if stay_full_access {
-            Vec::new()
-        } else {
-            presets
-                .iter()
-                .find(|preset| preset.id == "read-only")
-                .map(|preset| {
-                    Self::approval_preset_actions(preset.approval, preset.sandbox.clone())
-                })
-                .unwrap_or_default()
-        };
-        let stay_label = if stay_full_access {
-            "Stay in Agent Full Access".to_string()
-        } else {
-            "Stay in Read-Only".to_string()
-        };
+        self.otel_manager
+            .counter("codex.windows_sandbox.elevated_prompt_shown", 1, &[]);
 
         let mut header = ColumnRenderable::new();
         header.push(*Box::new(
@@ -3673,11 +3715,39 @@ impl ChatWidget {
             .wrap(Wrap { trim: false }),
         ));
 
+        let stay_label = if stay_full_access {
+            "Stay in Agent Full Access".to_string()
+        } else {
+            "Stay in Read-Only".to_string()
+        };
+        let mut stay_actions = if stay_full_access {
+            Vec::new()
+        } else {
+            presets
+                .iter()
+                .find(|preset| preset.id == "read-only")
+                .map(|preset| {
+                    Self::approval_preset_actions(preset.approval, preset.sandbox.clone())
+                })
+                .unwrap_or_default()
+        };
+        stay_actions.insert(
+            0,
+            Box::new({
+                let otel = self.otel_manager.clone();
+                move |_tx| {
+                    otel.counter("codex.windows_sandbox.elevated_prompt_decline", 1, &[]);
+                }
+            }),
+        );
+
+        let accept_otel = self.otel_manager.clone();
         let items = vec![
             SelectionItem {
                 name: "Set up agent sandbox (requires elevation)".to_string(),
                 description: None,
                 actions: vec![Box::new(move |tx| {
+                    accept_otel.counter("codex.windows_sandbox.elevated_prompt_accept", 1, &[]);
                     tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
                         preset: preset.clone(),
                     });
@@ -3725,23 +3795,6 @@ impl ChatWidget {
             .is_some_and(|preset| {
                 Self::preset_matches_current(current_approval, current_sandbox, preset)
             });
-        let stay_actions = if stay_full_access {
-            Vec::new()
-        } else {
-            presets
-                .iter()
-                .find(|preset| preset.id == "read-only")
-                .map(|preset| {
-                    Self::approval_preset_actions(preset.approval, preset.sandbox.clone())
-                })
-                .unwrap_or_default()
-        };
-        let stay_label = if stay_full_access {
-            "Stay in Agent Full Access".to_string()
-        } else {
-            "Stay in Read-Only".to_string()
-        };
-
         let mut lines = Vec::new();
         lines.push(line!["Use Non-Elevated Sandbox?".bold()]);
         lines.push(line![""]);
@@ -3757,14 +3810,44 @@ impl ChatWidget {
 
         let elevated_preset = preset.clone();
         let legacy_preset = preset;
+        let stay_label = if stay_full_access {
+            "Stay in Agent Full Access".to_string()
+        } else {
+            "Stay in Read-Only".to_string()
+        };
+        let mut stay_actions = if stay_full_access {
+            Vec::new()
+        } else {
+            presets
+                .iter()
+                .find(|preset| preset.id == "read-only")
+                .map(|preset| {
+                    Self::approval_preset_actions(preset.approval, preset.sandbox.clone())
+                })
+                .unwrap_or_default()
+        };
+        stay_actions.insert(
+            0,
+            Box::new({
+                let otel = self.otel_manager.clone();
+                move |_tx| {
+                    otel.counter("codex.windows_sandbox.fallback_stay_current", 1, &[]);
+                }
+            }),
+        );
         let items = vec![
             SelectionItem {
                 name: "Try elevated agent sandbox setup again".to_string(),
                 description: None,
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
-                        preset: elevated_preset.clone(),
-                    });
+                actions: vec![Box::new({
+                    let otel = self.otel_manager.clone();
+                    let preset = elevated_preset;
+                    move |tx| {
+                        otel.counter("codex.windows_sandbox.fallback_retry_elevated", 1, &[]);
+                        tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
+                            preset: preset.clone(),
+                        });
+                    }
                 })],
                 dismiss_on_select: true,
                 ..Default::default()
@@ -3772,11 +3855,16 @@ impl ChatWidget {
             SelectionItem {
                 name: "Use non-elevated agent sandbox".to_string(),
                 description: None,
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
-                        preset: legacy_preset.clone(),
-                        mode: WindowsSandboxEnableMode::Legacy,
-                    });
+                actions: vec![Box::new({
+                    let otel = self.otel_manager.clone();
+                    let preset = legacy_preset;
+                    move |tx| {
+                        otel.counter("codex.windows_sandbox.fallback_use_legacy", 1, &[]);
+                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
+                            preset: preset.clone(),
+                            mode: WindowsSandboxEnableMode::Legacy,
+                        });
+                    }
                 })],
                 dismiss_on_select: true,
                 ..Default::default()
@@ -4026,7 +4114,11 @@ impl ChatWidget {
     }
 
     /// Build a placeholder header cell while the session is configuring.
-    fn placeholder_session_header_cell(config: &Config) -> Box<dyn HistoryCell> {
+    fn placeholder_session_header_cell(
+        config: &Config,
+        is_collaboration: bool,
+        collaboration_mode: CollaborationMode,
+    ) -> Box<dyn HistoryCell> {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
         Box::new(history_cell::SessionHeaderHistoryCell::new_with_style(
             DEFAULT_MODEL_DISPLAY_NAME.to_string(),
@@ -4034,6 +4126,8 @@ impl ChatWidget {
             None,
             config.cwd.clone(),
             CODEX_CLI_VERSION,
+            is_collaboration,
+            collaboration_mode,
         ))
     }
 
