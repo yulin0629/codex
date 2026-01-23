@@ -814,6 +814,8 @@ async fn make_chatwidget_manual(
         stream_controller: None,
         running_commands: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
+        skills_all: Vec::new(),
+        skills_initial_state: None,
         last_unified_wait: None,
         unified_exec_wait_streak: None,
         task_complete_pending: false,
@@ -2082,6 +2084,7 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode: Some(CollaborationMode::PairProgramming(_)),
+            personality: None,
             ..
         } => {}
         other => {
@@ -2095,6 +2098,7 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode: Some(CollaborationMode::PairProgramming(_)),
+            personality: None,
             ..
         } => {}
         other => {
@@ -2115,6 +2119,7 @@ async fn collab_mode_defaults_to_pair_programming_when_enabled() {
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode: Some(CollaborationMode::PairProgramming(_)),
+            personality: None,
             ..
         } => {}
         other => {
@@ -2789,7 +2794,7 @@ async fn full_access_confirmation_popup_snapshot() {
         .into_iter()
         .find(|preset| preset.id == "full-access")
         .expect("full access preset");
-    chat.open_full_access_confirmation(preset);
+    chat.open_full_access_confirmation(preset, false);
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("full_access_confirmation_popup", popup);
@@ -3110,7 +3115,7 @@ async fn approvals_popup_navigation_skips_disabled() {
         .expect("render approvals popup after disabled selection");
     let screen = terminal.backend().vt100().screen().contents();
     assert!(
-        screen.contains("Select Approval Mode"),
+        screen.contains("Update Model Permissions"),
         "popup should remain open after selecting a disabled entry"
     );
     assert!(
@@ -3130,6 +3135,7 @@ async fn approvals_popup_navigation_skips_disabled() {
             ev,
             AppEvent::CodexOp(Op::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::OnRequest),
+                personality: None,
                 ..
             })
         )),
@@ -3140,6 +3146,7 @@ async fn approvals_popup_navigation_skips_disabled() {
             ev,
             AppEvent::CodexOp(Op::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::Never),
+                personality: None,
                 ..
             })
         )),
