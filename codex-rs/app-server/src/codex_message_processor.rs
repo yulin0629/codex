@@ -13,6 +13,9 @@ use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AddConversationListenerParams;
 use codex_app_server_protocol::AddConversationSubscriptionResponse;
+use codex_app_server_protocol::AppInfo as ApiAppInfo;
+use codex_app_server_protocol::AppsListParams;
+use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ArchiveConversationParams;
 use codex_app_server_protocol::ArchiveConversationResponse;
 use codex_app_server_protocol::AskForApproval;
@@ -122,6 +125,7 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_app_server_protocol::build_turns_from_event_msgs;
 use codex_backend_client::Client as BackendClient;
+use codex_chatgpt::connectors;
 use codex_core::AuthManager;
 use codex_core::CodexThread;
 use codex_core::Cursor as RolloutCursor;
@@ -165,6 +169,7 @@ use codex_login::ShutdownHandle;
 use codex_login::run_login_server;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::config_types::Personality;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
@@ -410,6 +415,9 @@ impl CodexMessageProcessor {
             }
             ClientRequest::SkillsList { request_id, params } => {
                 self.skills_list(request_id, params).await;
+            }
+            ClientRequest::AppsList { request_id, params } => {
+                self.apps_list(request_id, params).await;
             }
             ClientRequest::SkillsConfigWrite { request_id, params } => {
                 self.skills_config_write(request_id, params).await;
@@ -1398,6 +1406,7 @@ impl CodexMessageProcessor {
             params.sandbox,
             params.base_instructions,
             params.developer_instructions,
+            params.personality,
         );
 
         let config =
@@ -1511,6 +1520,7 @@ impl CodexMessageProcessor {
         sandbox: Option<SandboxMode>,
         base_instructions: Option<String>,
         developer_instructions: Option<String>,
+        personality: Option<Personality>,
     ) -> ConfigOverrides {
         ConfigOverrides {
             model,
@@ -1522,6 +1532,7 @@ impl CodexMessageProcessor {
             codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.clone(),
             base_instructions,
             developer_instructions,
+            model_personality: personality,
             ..Default::default()
         }
     }
@@ -1829,6 +1840,7 @@ impl CodexMessageProcessor {
             config: request_overrides,
             base_instructions,
             developer_instructions,
+            personality,
         } = params;
 
         let thread_history = if let Some(history) = history {
@@ -1914,6 +1926,7 @@ impl CodexMessageProcessor {
             sandbox,
             base_instructions,
             developer_instructions,
+            personality,
         );
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
@@ -2098,6 +2111,7 @@ impl CodexMessageProcessor {
             sandbox,
             base_instructions,
             developer_instructions,
+            None,
         );
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match derive_config_for_cwd(
@@ -3406,6 +3420,102 @@ impl CodexMessageProcessor {
             .await;
     }
 
+    async fn apps_list(&self, request_id: RequestId, params: AppsListParams) {
+        let AppsListParams { cursor, limit } = params;
+        let config = match self.load_latest_config().await {
+            Ok(config) => config,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+
+        if !config.features.enabled(Feature::Connectors) {
+            self.outgoing
+                .send_response(
+                    request_id,
+                    AppsListResponse {
+                        data: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+                .await;
+            return;
+        }
+
+        let connectors = match connectors::list_connectors(&config).await {
+            Ok(connectors) => connectors,
+            Err(err) => {
+                self.send_internal_error(request_id, format!("failed to list apps: {err}"))
+                    .await;
+                return;
+            }
+        };
+
+        let total = connectors.len();
+        if total == 0 {
+            self.outgoing
+                .send_response(
+                    request_id,
+                    AppsListResponse {
+                        data: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+                .await;
+            return;
+        }
+
+        let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
+        let effective_limit = effective_limit.min(total);
+        let start = match cursor {
+            Some(cursor) => match cursor.parse::<usize>() {
+                Ok(idx) => idx,
+                Err(_) => {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!("invalid cursor: {cursor}"),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => 0,
+        };
+
+        if start > total {
+            self.send_invalid_request_error(
+                request_id,
+                format!("cursor {start} exceeds total apps {total}"),
+            )
+            .await;
+            return;
+        }
+
+        let end = start.saturating_add(effective_limit).min(total);
+        let data = connectors[start..end]
+            .iter()
+            .cloned()
+            .map(|connector| ApiAppInfo {
+                id: connector.connector_id,
+                name: connector.connector_name,
+                description: connector.connector_description,
+                logo_url: connector.logo_url,
+                install_url: connector.install_url,
+                is_accessible: connector.is_accessible,
+            })
+            .collect();
+
+        let next_cursor = if end < total {
+            Some(end.to_string())
+        } else {
+            None
+        };
+        self.outgoing
+            .send_response(request_id, AppsListResponse { data, next_cursor })
+            .await;
+    }
+
     async fn skills_list(&self, request_id: RequestId, params: SkillsListParams) {
         let SkillsListParams { cwds, force_reload } = params;
         let cwds = if cwds.is_empty() {
@@ -3512,7 +3622,8 @@ impl CodexMessageProcessor {
             || params.model.is_some()
             || params.effort.is_some()
             || params.summary.is_some()
-            || params.collaboration_mode.is_some();
+            || params.collaboration_mode.is_some()
+            || params.personality.is_some();
 
         // If any overrides are provided, update the session turn context first.
         if has_any_overrides {
@@ -3525,7 +3636,7 @@ impl CodexMessageProcessor {
                     effort: params.effort.map(Some),
                     summary: params.summary,
                     collaboration_mode: params.collaboration_mode,
-                    personality: None,
+                    personality: params.personality,
                 })
                 .await;
         }

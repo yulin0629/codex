@@ -89,6 +89,7 @@ Example (from OpenAI's official VSCode extension):
 - `model/list` — list available models (with reasoning effort options).
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination).
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
+- `app/list` — list available apps.
 - `skills/config/write` — write user-level skill config by path.
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
@@ -113,6 +114,7 @@ Start a fresh thread when you need a new Codex conversation.
     "cwd": "/Users/me/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
+    "personality": "friendly"
 } }
 { "id": 10, "result": {
     "thread": {
@@ -125,10 +127,13 @@ Start a fresh thread when you need a new Codex conversation.
 { "method": "thread/started", "params": { "thread": { … } } }
 ```
 
-To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted:
+To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, such as `personality`:
 
 ```json
-{ "method": "thread/resume", "id": 11, "params": { "threadId": "thr_123" } }
+{ "method": "thread/resume", "id": 11, "params": {
+    "threadId": "thr_123",
+    "personality": "friendly"
+} }
 { "id": 11, "result": { "thread": { "id": "thr_123", … } } }
 ```
 
@@ -230,6 +235,7 @@ You can optionally specify config overrides on the new turn. If specified, these
     "model": "gpt-5.1-codex",
     "effort": "medium",
     "summary": "concise",
+    "personality": "friendly",
     // Optional JSON Schema to constrain the final assistant message for this turn.
     "outputSchema": {
         "type": "object",
