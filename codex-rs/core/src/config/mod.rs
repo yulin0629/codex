@@ -18,6 +18,7 @@ use crate::config::types::ShellEnvironmentPolicyToml;
 use crate::config::types::SkillsConfig;
 use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
+use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigRequirements;
 use crate::config_loader::LoaderOverrides;
@@ -56,7 +57,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
-use dirs::home_dir;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -366,6 +366,7 @@ pub struct ConfigBuilder {
     cli_overrides: Option<Vec<(String, TomlValue)>>,
     harness_overrides: Option<ConfigOverrides>,
     loader_overrides: Option<LoaderOverrides>,
+    cloud_requirements: CloudRequirementsLoader,
     fallback_cwd: Option<PathBuf>,
 }
 
@@ -390,6 +391,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn cloud_requirements(mut self, cloud_requirements: CloudRequirementsLoader) -> Self {
+        self.cloud_requirements = cloud_requirements;
+        self
+    }
+
     pub fn fallback_cwd(mut self, fallback_cwd: Option<PathBuf>) -> Self {
         self.fallback_cwd = fallback_cwd;
         self
@@ -401,6 +407,7 @@ impl ConfigBuilder {
             cli_overrides,
             harness_overrides,
             loader_overrides,
+            cloud_requirements,
             fallback_cwd,
         } = self;
         let codex_home = codex_home.map_or_else(find_codex_home, std::io::Result::Ok)?;
@@ -413,9 +420,14 @@ impl ConfigBuilder {
             None => AbsolutePathBuf::current_dir()?,
         };
         harness_overrides.cwd = Some(cwd.to_path_buf());
-        let config_layer_stack =
-            load_config_layers_state(&codex_home, Some(cwd), &cli_overrides, loader_overrides)
-                .await?;
+        let config_layer_stack = load_config_layers_state(
+            &codex_home,
+            Some(cwd),
+            &cli_overrides,
+            loader_overrides,
+            cloud_requirements,
+        )
+        .await?;
         let merged_toml = config_layer_stack.effective_config();
 
         // Note that each layer in ConfigLayerStack should have resolved
@@ -511,6 +523,7 @@ pub async fn load_config_as_toml_with_cli_overrides(
         Some(cwd.clone()),
         &cli_overrides,
         LoaderOverrides::default(),
+        CloudRequirementsLoader::default(),
     )
     .await?;
 
@@ -609,9 +622,14 @@ pub async fn load_global_mcp_servers(
     // There is no cwd/project context for this query, so this will not include
     // MCP servers defined in in-repo .codex/ folders.
     let cwd: Option<AbsolutePathBuf> = None;
-    let config_layer_stack =
-        load_config_layers_state(codex_home, cwd, &cli_overrides, LoaderOverrides::default())
-            .await?;
+    let config_layer_stack = load_config_layers_state(
+        codex_home,
+        cwd,
+        &cli_overrides,
+        LoaderOverrides::default(),
+        CloudRequirementsLoader::default(),
+    )
+    .await?;
     let merged_toml = config_layer_stack.effective_config();
     let Some(servers_value) = merged_toml.get("mcp_servers") else {
         return Ok(BTreeMap::new());
@@ -1227,10 +1245,14 @@ fn resolve_web_search_mode(
 
 pub(crate) fn resolve_web_search_mode_for_turn(
     explicit_mode: Option<WebSearchMode>,
+    is_azure_responses_endpoint: bool,
     sandbox_policy: &SandboxPolicy,
 ) -> WebSearchMode {
     if let Some(mode) = explicit_mode {
         return mode;
+    }
+    if is_azure_responses_endpoint {
+        return WebSearchMode::Disabled;
     }
     if matches!(sandbox_policy, SandboxPolicy::DangerFullAccess) {
         WebSearchMode::Live
@@ -1493,6 +1515,7 @@ impl Config {
             approval_policy: mut constrained_approval_policy,
             sandbox_policy: mut constrained_sandbox_policy,
             mcp_servers,
+            exec_policy: _,
         } = requirements;
 
         constrained_approval_policy
@@ -1729,27 +1752,12 @@ fn toml_uses_deprecated_instructions_file(value: &TomlValue) -> bool {
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
-///   function will Err if the path does not exist.
+/// - If `CODEX_HOME` is set, the value must exist and be a directory. The
+///   value will be canonicalized and this function will Err otherwise.
 /// - If `CODEX_HOME` is not set, this function does not verify that the
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
-    // Honor the `CODEX_HOME` environment variable when it is set to allow users
-    // (and tests) to override the default location.
-    if let Ok(val) = std::env::var("CODEX_HOME")
-        && !val.is_empty()
-    {
-        return PathBuf::from(val).canonicalize();
-    }
-
-    let mut p = home_dir().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Could not find home directory",
-        )
-    })?;
-    p.push(".codex");
-    Ok(p)
+    codex_utils_home_dir::find_codex_home()
 }
 
 /// Returns the path to the folder where Codex logs are stored. Does not verify
@@ -2327,14 +2335,14 @@ trust_level = "trusted"
 
     #[test]
     fn web_search_mode_for_turn_defaults_to_cached_when_unset() {
-        let mode = resolve_web_search_mode_for_turn(None, &SandboxPolicy::ReadOnly);
+        let mode = resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::ReadOnly);
 
         assert_eq!(mode, WebSearchMode::Cached);
     }
 
     #[test]
     fn web_search_mode_for_turn_defaults_to_live_for_danger_full_access() {
-        let mode = resolve_web_search_mode_for_turn(None, &SandboxPolicy::DangerFullAccess);
+        let mode = resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::DangerFullAccess);
 
         assert_eq!(mode, WebSearchMode::Live);
     }
@@ -2343,10 +2351,18 @@ trust_level = "trusted"
     fn web_search_mode_for_turn_prefers_explicit_value() {
         let mode = resolve_web_search_mode_for_turn(
             Some(WebSearchMode::Cached),
+            false,
             &SandboxPolicy::DangerFullAccess,
         );
 
         assert_eq!(mode, WebSearchMode::Cached);
+    }
+
+    #[test]
+    fn web_search_mode_for_turn_disables_for_azure_responses_endpoint() {
+        let mode = resolve_web_search_mode_for_turn(None, true, &SandboxPolicy::DangerFullAccess);
+
+        assert_eq!(mode, WebSearchMode::Disabled);
     }
 
     #[test]
@@ -2611,8 +2627,14 @@ profile = "project"
         };
 
         let cwd = AbsolutePathBuf::try_from(codex_home.path())?;
-        let config_layer_stack =
-            load_config_layers_state(codex_home.path(), Some(cwd), &Vec::new(), overrides).await?;
+        let config_layer_stack = load_config_layers_state(
+            codex_home.path(),
+            Some(cwd),
+            &Vec::new(),
+            overrides,
+            CloudRequirementsLoader::default(),
+        )
+        .await?;
         let cfg = deserialize_config_toml_with_base(
             config_layer_stack.effective_config(),
             codex_home.path(),
@@ -2739,6 +2761,7 @@ profile = "project"
             Some(cwd),
             &[("model".to_string(), TomlValue::String("cli".to_string()))],
             overrides,
+            CloudRequirementsLoader::default(),
         )
         .await?;
 
